@@ -12,7 +12,6 @@ st.set_page_config(page_title="국토종주 누적거리 트래커", layout="wid
 # ───────────────────────────────────────────────────────────────────────────────
 # 0) 공식 총거리(국토부/자전거행복나눔) 고정값
 #    CSV에 구간 일부만 있어도, 여기 값으로 '노선 총거리'를 항상 보여줍니다.
-#    필요하면 아래 dict에 노선명을 추가/수정하세요.
 # ───────────────────────────────────────────────────────────────────────────────
 OFFICIAL_TOTALS = {
     "아라자전거길": 21,
@@ -26,9 +25,25 @@ OFFICIAL_TOTALS = {
     "북한강자전거길": 70,
     "동해안자전거길(강원구간)": 242,
     "동해안자전거길(경북구간)": 76,
-    "낙동강자전거길": 389,           # 공식 총거리
+    "낙동강자전거길": 389,
     "제주환상": 234,
+    # 필요 시 여기에 추가
 }
+
+# ▶ 별칭/표기 차이 보정(공백/괄호/‘자전거길’ 제거)용 정규화 키 생성
+def _keyize(s: str) -> str:
+    return (
+        str(s)
+        .replace("자전거길", "")
+        .replace(" ", "")
+        .replace("(", "")
+        .replace(")", "")
+        .replace("-", "")
+        .replace("_", "")
+        .strip()
+    )
+
+OFFICIAL_TOTALS_NORM = {_keyize(k): v for k, v in OFFICIAL_TOTALS.items()}
 
 # ───────────────────────────────────────────────────────────────────────────────
 # 1) CSV 로더
@@ -50,7 +65,6 @@ def load_routes(src: str | Path | bytes) -> pd.DataFrame:
 
     if "id" not in df.columns:
         df["id"] = (df["route"].astype(str) + "@" + df["section"].astype(str)).str.replace(r"\s+", "", regex=True)
-
     return df
 
 
@@ -124,11 +138,16 @@ if tab == "🚴 구간(거리) 추적":
         st.stop()
     df = df[df["route"].isin(route_pick)].copy()
 
-    # (A) 선택 노선 총거리 요약 – 항상 OFFICIAL_TOTALS 우선
+    # (A) 선택 노선 총거리 요약 – OFFICIAL_TOTALS 우선(표기/별칭 자동 보정)
     def official_total(route: str) -> float:
+        # 1) 정확히 일치
         if route in OFFICIAL_TOTALS:
             return float(OFFICIAL_TOTALS[route])
-        # fallback: CSV에 있는 거리 합
+        # 2) 정규화 키로 검색(공백/괄호/‘자전거길’ 제거, 하이픈/언더바 제거)
+        k = _keyize(route)
+        if k in OFFICIAL_TOTALS_NORM:
+            return float(OFFICIAL_TOTALS_NORM[k])
+        # 3) 못 찾으면 CSV 합계
         return float(routes.loc[routes["route"] == route, "distance_km"].sum())
 
     with st.expander("선택 노선 총거리 요약", expanded=True):
@@ -167,7 +186,6 @@ if tab == "🚴 구간(거리) 추적":
     c1.metric("선택 구간 총거리(표 합계)", f"{total_km:,.1f} km")
     c2.metric("완료 누적거리", f"{done_km:,.1f} km")
     c3.metric("남은 거리", f"{left_km:,.1f} km")
-    # 단일 노선 선택 시 공식 총거리도 함께 노출
     if len(route_pick) == 1:
         c4.metric("공식 노선 총거리", f"{official_total(route_pick[0]):,.1f} km")
     else:
@@ -185,7 +203,8 @@ if tab == "🚴 구간(거리) 추적":
 
     df["__path"] = None
     if "path" in df.columns:
-        df["__path"] = df["path"].dropna().map(parse_path)
+        # dropna().map() 대신 apply로 전체 행 정렬 문제 방지
+        df["__path"] = df["path"].apply(parse_path)
 
     paths = df[df["__path"].notna()].copy()
 
@@ -210,7 +229,9 @@ if tab == "🚴 구간(거리) 추적":
 
     layers = []
     if not paths.empty:
-        paths["__color"] = paths["id"].apply(lambda x: [28, 200, 138] if x in st.session_state.done_ids else [230, 57, 70])
+        paths["__color"] = paths["id"].apply(
+            lambda x: [28, 200, 138] if x in st.session_state.done_ids else [230, 57, 70]
+        )
         layers.append(pdk.Layer(
             "PathLayer",
             paths, get_path="__path", get_color="__color",
@@ -277,18 +298,23 @@ else:
     c3.metric("남은 인증센터", f"{left_cnt:,}")
 
     geo = dfc.dropna(subset=["lat", "lng"]).copy()
-    geo["__color"] = geo["id"].apply(lambda x: [28, 200, 138] if x in st.session_state.done_center_ids else [230, 57, 70])
+    geo["__color"] = geo["id"].apply(
+        lambda x: [28, 200, 138] if x in st.session_state.done_center_ids else [230, 57, 70]
+    )
     if not geo.empty:
         view = pdk.ViewState(latitude=float(geo["lat"].mean()), longitude=float(geo["lng"].mean()), zoom=7)
         layer = pdk.Layer(
             "ScatterplotLayer",
-            geo.rename(columns={"lat":"latitude","lng":"longitude"}),
+            geo.rename(columns={"lat": "latitude", "lng": "longitude"}),
             get_position='[longitude, latitude]',
             get_fill_color="__color",
             get_radius=180,
             pickable=True,
         )
-        st.pydeck_chart(pdk.Deck(layers=[layer], initial_view_state=view,
-                                 tooltip={"text": "{route} / {center}\n{address}"}), use_container_width=True)
+        st.pydeck_chart(
+            pdk.Deck(layers=[layer], initial_view_state=view,
+                     tooltip={"text": "{route} / {center}\n{address}"}),
+            use_container_width=True
+        )
     else:
         st.info("이 필터에는 좌표(lat,lng)가 없는 센터가 있습니다. centers.csv 에 좌표를 채우면 지도에 표시됩니다.")
