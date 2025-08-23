@@ -9,59 +9,18 @@ import pydeck as pdk
 st.set_page_config(page_title="국토종주 누적거리 트래커", layout="wide")
 
 # -----------------------------
-# 0) 이미지 인덱스(갤러리) 유틸
-# -----------------------------
-@st.cache_data
-def build_image_index(img_dir: str = "images") -> dict[str, str]:
-    """images/ 폴더의 그림파일을 {정규화키: 파일경로} 형태로 수집"""
-    p = Path(img_dir)
-    if not p.exists():
-        return {}
-    exts = {".png", ".jpg", ".jpeg", ".webp"}
-    idx: dict[str, str] = {}
-    for f in p.iterdir():
-        if f.suffix.lower() in exts:
-            key = (
-                f.stem.replace(" ", "")
-                    .replace("(", "")
-                    .replace(")", "")
-            )
-            idx[key] = str(f)
-    return idx
-
-def find_img_for_route(route_name: str, idx: dict[str, str]) -> str | None:
-    """노선명으로 이미지 추정 매칭(부분일치/별칭 포함)"""
-    norm = route_name.replace(" ", "").replace("(", "").replace(")", "")
-    alias = {
-        "동해안강원": "동해안자전거길강원",
-        "동해안경북": "동해안자전거길경북",
-        "제주환상자전거길": "제주환상",
-    }
-    norm = alias.get(norm, norm)
-
-    # 정확히 일치
-    if norm in idx:
-        return idx[norm]
-
-    # 부분 일치
-    for k, path in idx.items():
-        if norm in k or k in norm:
-            return path
-    return None
-
-
-# -----------------------------
 # 1) 데이터 로드
 # -----------------------------
 @st.cache_data
 def load_routes(src: str | Path | bytes) -> pd.DataFrame:
     df = pd.read_csv(src) if isinstance(src, (str, Path)) else pd.read_csv(src)
 
-    # 기본 전처리
+    # 문자열 전처리
     for c in ["category", "route", "section", "start", "end"]:
         if c in df.columns:
             df[c] = df[c].astype(str).str.strip()
 
+    # 숫자 캐스팅
     for c in ["distance_km", "start_lat", "start_lng", "end_lat", "end_lng"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -72,7 +31,7 @@ def load_routes(src: str | Path | bytes) -> pd.DataFrame:
             df["route"].astype(str) + "@" + df["section"].astype(str)
         ).str.replace(r"\s+", "", regex=True)
 
-    # ====== 🔹 대분류 자동 산정(노선명 기준) ======
+    # ===== 대분류 자동 산정(노선명 기준) =====
     four_rivers = {
         "한강종주자전거길", "한강종주자전거길(서울구간)",
         "금강자전거길", "영산강자전거길", "낙동강자전거길",
@@ -80,7 +39,7 @@ def load_routes(src: str | Path | bytes) -> pd.DataFrame:
 
     def big_category_by_route(route: str) -> str:
         r = str(route)
-        if any(x in r for x in ("동해안", "동해안자전거길")):
+        if "동해안" in r:
             return "동해안자전거길"
         if "제주" in r:
             return "제주환상"
@@ -88,7 +47,7 @@ def load_routes(src: str | Path | bytes) -> pd.DataFrame:
             return "4대강"
         return "내륙/연결"
 
-    # CSV의 category 값과 관계 없이 'category'를 통일 규칙으로 재정의
+    # CSV의 category와 상관없이 통일 규칙 적용
     df["category"] = df["route"].apply(big_category_by_route)
 
     return df
@@ -143,7 +102,6 @@ with st.sidebar.expander("진행상태 저장/불러오기", expanded=False):
 # -----------------------------
 st.sidebar.header("구간 선택")
 
-# 원하는 순서로 대분류 노출
 CATEGORY_ORDER = ["전체구간", "4대강", "동해안자전거길", "제주환상", "내륙/연결"]
 cat = st.sidebar.selectbox("대분류", options=CATEGORY_ORDER, index=0)
 
@@ -166,22 +124,7 @@ st.caption(f"🔎 필터: 카테고리 **{cat}**, 노선 **{', '.join(route_pick
 
 
 # -----------------------------
-# 4-1) 노선 안내도(이미지 갤러리)
-# -----------------------------
-img_index = build_image_index("images")
-with st.expander("노선 안내도(이미지)", expanded=True):
-    shown = 0
-    for rname in route_pick:
-        ipath = find_img_for_route(rname, img_index)
-        if ipath:
-            st.image(ipath, caption=rname, use_column_width=True)
-            shown += 1
-    if shown == 0:
-        st.info("images/ 폴더에 해당 노선 이미지가 없거나 파일명이 노선명과 달라요.")
-
-
-# -----------------------------
-# 5) 완료 체크 UI
+# 5) 완료 체크 UI (행 단위)
 # -----------------------------
 df["완료"] = df["id"].isin(st.session_state.done_ids)
 
@@ -205,7 +148,7 @@ st.session_state.done_ids = new_done
 
 
 # -----------------------------
-# 6) KPI
+# 6) KPI (전체 합계)
 # -----------------------------
 total_km = float(df["distance_km"].sum())
 done_km  = float(df[df["id"].isin(st.session_state.done_ids)]["distance_km"].sum())
@@ -218,10 +161,34 @@ c4.metric("완료율", f"{(done_km/total_km*100 if total_km>0 else 0):.1f}%")
 
 
 # -----------------------------
-# 7) 지도 (pydeck)
+# 6-1) 노선별 요약(합계/완료/잔여)
+# -----------------------------
+summary = (
+    df.assign(done=df["id"].isin(st.session_state.done_ids).astype(int))
+      .groupby("route", as_index=False)
+      .agg(total_km=("distance_km","sum"),
+           done_km =("distance_km", lambda s: float(s[df.loc[s.index, "id"].isin(st.session_state.done_ids)].sum())))
+)
+summary["left_km"] = (summary["total_km"] - summary["done_km"]).clip(lower=0)
+summary["done_%"]  = np.where(summary["total_km"]>0, summary["done_km"]/summary["total_km"]*100, 0)
+
+st.subheader("노선별 요약")
+st.dataframe(
+    summary.rename(columns={
+        "route": "노선",
+        "total_km": "총거리(km)",
+        "done_km": "완료(km)",
+        "left_km": "잔여(km)",
+        "done_%": "완료율(%)"
+    }).round({"총거리(km)":1,"완료(km)":1,"잔여(km)":1,"완료율(%)":1}),
+    use_container_width=True
+)
+
+
+# -----------------------------
+# 7) 지도 (pydeck) — 좌표가 있으면 선/점 표시
 # -----------------------------
 def to_path(row):
-    # path 컬럼(JSON 문자열)이 있으면 사용
     if "path" in row and pd.notna(row["path"]):
         try:
             val = json.loads(row["path"])
@@ -229,7 +196,6 @@ def to_path(row):
                 return val
         except Exception:
             pass
-    # fallback: 직선
     if (
         pd.notna(row.get("start_lng")) and pd.notna(row.get("start_lat"))
         and pd.notna(row.get("end_lng")) and pd.notna(row.get("end_lat"))
@@ -240,7 +206,6 @@ def to_path(row):
 df["__path"] = df.apply(to_path, axis=1)
 paths = df[df["__path"].notna()].copy()
 
-# 중심점
 def mid_lon_lat(row):
     xs = [row.get("start_lng"), row.get("end_lng")]
     ys = [row.get("start_lat"), row.get("end_lat")]
@@ -259,7 +224,6 @@ center_lng, center_lat = (127.5, 36.2) if not centers else (
 
 layers = []
 if not paths.empty:
-    # 행마다 색상 부여(완료=초록, 미완료=빨강)
     paths["__color"] = paths["id"].apply(lambda x: [28, 200, 138] if x in st.session_state.done_ids else [230, 57, 70])
     layers.append(
         pdk.Layer(
@@ -273,7 +237,6 @@ if not paths.empty:
         )
     )
 else:
-    # 좌표가 없으면 시작/끝 점 표시
     pts = []
     for _, r in df.iterrows():
         for (lng, lat, label) in [
@@ -304,4 +267,4 @@ view = pdk.ViewState(latitude=center_lat, longitude=center_lng, zoom=7)
 deck = pdk.Deck(layers=layers, initial_view_state=view, tooltip={"text": "{name}"})
 st.pydeck_chart(deck, use_container_width=True)
 
-st.caption("💡 선형 경로를 보려면 CSV의 path 열에 [ [lng,lat], [lng,lat], ... ] 형식 JSON을 넣어주세요. 좌표가 없으면 시작/끝 점으로 표시합니다. 이미지 파일은 images/ 폴더에 두면 노선명으로 자동 매칭하여 보여줍니다.")
+st.caption("💡 표의 거리/구간은 data/routes.csv 내용을 그대로 사용합니다. 필요 시 CSV를 업데이트해 주세요.")
