@@ -9,6 +9,48 @@ import pydeck as pdk
 st.set_page_config(page_title="국토종주 누적거리 트래커", layout="wide")
 
 # -----------------------------
+# 0) 이미지 인덱스(갤러리) 유틸
+# -----------------------------
+@st.cache_data
+def build_image_index(img_dir: str = "images") -> dict[str, str]:
+    """images/ 폴더의 그림파일을 {정규화키: 파일경로} 형태로 수집"""
+    p = Path(img_dir)
+    if not p.exists():
+        return {}
+    exts = {".png", ".jpg", ".jpeg", ".webp"}
+    idx: dict[str, str] = {}
+    for f in p.iterdir():
+        if f.suffix.lower() in exts:
+            key = (
+                f.stem.replace(" ", "")
+                    .replace("(", "")
+                    .replace(")", "")
+            )
+            idx[key] = str(f)
+    return idx
+
+def find_img_for_route(route_name: str, idx: dict[str, str]) -> str | None:
+    """노선명으로 이미지 추정 매칭(부분일치/별칭 포함)"""
+    norm = route_name.replace(" ", "").replace("(", "").replace(")", "")
+    alias = {
+        "동해안강원": "동해안자전거길강원",
+        "동해안경북": "동해안자전거길경북",
+        "제주환상자전거길": "제주환상",
+    }
+    norm = alias.get(norm, norm)
+
+    # 정확히 일치
+    if norm in idx:
+        return idx[norm]
+
+    # 부분 일치
+    for k, path in idx.items():
+        if norm in k or k in norm:
+            return path
+    return None
+
+
+# -----------------------------
 # 1) 데이터 로드
 # -----------------------------
 @st.cache_data
@@ -121,6 +163,21 @@ if len(route_pick) == 0:
 
 df = df[df["route"].isin(route_pick)].copy()
 st.caption(f"🔎 필터: 카테고리 **{cat}**, 노선 **{', '.join(route_pick)}**")
+
+
+# -----------------------------
+# 4-1) 노선 안내도(이미지 갤러리)
+# -----------------------------
+img_index = build_image_index("images")
+with st.expander("노선 안내도(이미지)", expanded=True):
+    shown = 0
+    for rname in route_pick:
+        ipath = find_img_for_route(rname, img_index)
+        if ipath:
+            st.image(ipath, caption=rname, use_column_width=True)
+            shown += 1
+    if shown == 0:
+        st.info("images/ 폴더에 해당 노선 이미지가 없거나 파일명이 노선명과 달라요.")
 
 
 # -----------------------------
@@ -247,4 +304,4 @@ view = pdk.ViewState(latitude=center_lat, longitude=center_lng, zoom=7)
 deck = pdk.Deck(layers=layers, initial_view_state=view, tooltip={"text": "{name}"})
 st.pydeck_chart(deck, use_container_width=True)
 
-st.caption("💡 선형 경로를 보려면 CSV의 path 열에 [ [lng,lat], [lng,lat], ... ] 형식 JSON을 넣어주세요. 좌표가 없으면 시작/끝 점으로 표시합니다.")
+st.caption("💡 선형 경로를 보려면 CSV의 path 열에 [ [lng,lat], [lng,lat], ... ] 형식 JSON을 넣어주세요. 좌표가 없으면 시작/끝 점으로 표시합니다. 이미지 파일은 images/ 폴더에 두면 노선명으로 자동 매칭하여 보여줍니다.")
