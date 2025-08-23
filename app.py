@@ -1,4 +1,4 @@
-# app.py — 국토종주 우선 정렬 + 거리 보정 + 센터 경로 자동그리기 (완성본)
+# app.py — 국토종주 누적거리 트래커 (정렬/요약/지도 + 인증센터 누적거리)
 from __future__ import annotations
 import json, math
 from pathlib import Path
@@ -10,14 +10,16 @@ import pydeck as pdk
 st.set_page_config(page_title="국토종주 누적거리 트래커", layout="wide")
 
 # ───────────────────────────────────────────────────────────────────────────────
-# 공인 총거리(요약용)
+# 0) 공식 총거리(자전거행복나눔 기준) — 노선 총거리 표시에 사용
 # ───────────────────────────────────────────────────────────────────────────────
 OFFICIAL_TOTALS = {
+    # 국토종주 구성
     "아라자전거길": 21,
     "한강종주자전거길(서울구간)": 40,
     "남한강자전거길": 132,
     "새재자전거길": 100,
     "낙동강자전거길": 389,
+    # 그랜드슬램 기타
     "금강자전거길": 146,
     "영산강자전거길": 133,
     "섬진강자전거길": 148,
@@ -25,11 +27,12 @@ OFFICIAL_TOTALS = {
     "북한강자전거길": 70,
     "동해안자전거길(강원구간)": 242,
     "동해안자전거길(경북구간)": 76,
+    # 제주
     "제주환상": 234,
 }
 
 # ───────────────────────────────────────────────────────────────────────────────
-# 상위 카테고리 맵핑/순서
+# 1) 최상위 카테고리 체계
 # ───────────────────────────────────────────────────────────────────────────────
 GROUP_MAP = {
     # 국토종주코스
@@ -52,13 +55,14 @@ GROUP_MAP = {
 TOP_ORDER = ["국토종주코스", "제주환상자전거길", "그랜드슬램코스", "기타코스"]
 
 def CAT_LIST():
-    cats = list(dict.fromkeys(TOP_ORDER))  # 순서 보존 + 중복 제거
+    # 순서 유지 + 중복 제거 + '기타코스'는 항상 끝에 보장
+    cats = list(dict.fromkeys(TOP_ORDER))
     if "기타코스" not in cats:
         cats.append("기타코스")
     return cats
 
 # ───────────────────────────────────────────────────────────────────────────────
-# 낙동강 인증센터 기본 좌표(좌표 없을 때 자동 보정)
+# 2) 낙동강 인증센터 기본 좌표(좌표 비었을 때 자동 보정용, 근사치)
 # ───────────────────────────────────────────────────────────────────────────────
 DEFAULT_CENTER_COORDS = {
     "NAK-01": (36.4410, 128.2160),  # 상주 상풍교
@@ -75,9 +79,10 @@ DEFAULT_CENTER_COORDS = {
 }
 
 # ───────────────────────────────────────────────────────────────────────────────
-# 거리 계산 유틸(하버사인)
+# 3) 유틸
 # ───────────────────────────────────────────────────────────────────────────────
 def haversine_km(lat1, lon1, lat2, lon2):
+    # Haversine 거리(km)
     if any(pd.isna([lat1, lon1, lat2, lon2])): 
         return np.nan
     R = 6371.0088
@@ -87,11 +92,12 @@ def haversine_km(lat1, lon1, lat2, lon2):
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
 
 # ───────────────────────────────────────────────────────────────────────────────
-# CSV 로더
+# 4) CSV 로더
 # ───────────────────────────────────────────────────────────────────────────────
 @st.cache_data
 def load_routes(src: str | Path | bytes) -> pd.DataFrame:
     df = pd.read_csv(src) if isinstance(src, (str, Path)) else pd.read_csv(src)
+
     need = {"route", "section", "distance_km"}
     miss = need - set(df.columns)
     if miss:
@@ -107,49 +113,60 @@ def load_routes(src: str | Path | bytes) -> pd.DataFrame:
     if "id" not in df.columns:
         df["id"] = (df["route"].astype(str) + "@" + df["section"].astype(str)).str.replace(r"\s+", "", regex=True)
 
-    # 상위 카테고리 강제 적용 + 순서 고정
+    # CSV의 category 무시하고 상위 그룹 재정의
     df["category"] = df["route"].map(GROUP_MAP).fillna("기타코스")
-    df["category"] = pd.Categorical(df["category"], categories=CAT_LIST(), ordered=True)
+
+    # 카테고리 표시 순서 보장
+    try:
+        df["category"] = pd.Categorical(df["category"], categories=CAT_LIST(), ordered=True)
+    except Exception:
+        pass
+
     return df
+
 
 @st.cache_data
 def load_centers(src: str | Path | bytes) -> pd.DataFrame:
     df = pd.read_csv(src) if isinstance(src, (str, Path)) else pd.read_csv(src)
 
-    # 필수 컬럼 확보(없으면 생성)
-    must = ["route", "center"]
-    for c in must:
-        if c not in df.columns:
-            raise ValueError(f"centers.csv에 '{c}' 컬럼이 필요합니다.")
-    opt_num = ["lat","lng","seq","leg_km"]
-    for c in ["address","id"] + opt_num:
-        if c not in df.columns:
-            df[c] = np.nan
+    need = {"route", "center", "address", "lat", "lng", "id", "seq"}
+    miss = need - set(df.columns)
+    if miss:
+        raise ValueError(f"centers.csv에 다음 컬럼이 필요합니다: {sorted(miss)}")
 
-    for c in ["category","route","center","address","id"]:
-        df[c] = df[c].astype(str).str.strip()
-    for c in opt_num:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
+    for c in ["category", "route", "center", "address", "id"]:
+        if c in df.columns:
+            df[c] = df[c].astype(str).str.strip()
+    for c in ["lat", "lng", "seq", "leg_km"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    if df["id"].isna().any():
-        df["id"] = np.where(df["id"].isna(),
-                            (df["route"] + "@" + df["center"]).str.replace(r"\s+","",regex=True),
-                            df["id"])
+    # id 없으면 생성
+    if "id" not in df.columns or df["id"].isna().any():
+        df["id"] = np.where(
+            df.get("id").isna() if "id" in df.columns else True,
+            (df["route"] + "@" + df["center"]).str.replace(r"\s+", "", regex=True),
+            df.get("id", "")
+        )
 
-    # 좌표 보정(낙동강 기본좌표)
+    # 좌표 자동 보정(낙동강 기본 좌표 사용)
     for i, r in df.iterrows():
-        _id = r["id"]
-        if (pd.isna(r["lat"]) or pd.isna(r["lng"])) and _id in DEFAULT_CENTER_COORDS:
-            df.loc[i,"lat"] = DEFAULT_CENTER_COORDS[_id][0]
-            df.loc[i,"lng"] = DEFAULT_CENTER_COORDS[_id][1]
+        _id = r.get("id")
+        if (pd.isna(r.get("lat")) or pd.isna(r.get("lng"))) and _id in DEFAULT_CENTER_COORDS:
+            df.loc[i, "lat"] = DEFAULT_CENTER_COORDS[_id][0]
+            df.loc[i, "lng"] = DEFAULT_CENTER_COORDS[_id][1]
 
-    # 상위 카테고리 강제 적용 + 순서 고정
+    # 상위 그룹 재정의
     df["category"] = df["route"].map(GROUP_MAP).fillna("기타코스")
-    df["category"] = pd.Categorical(df["category"], categories=CAT_LIST(), ordered=True)
+    try:
+        df["category"] = pd.Categorical(df["category"], categories=CAT_LIST(), ordered=True)
+    except Exception:
+        pass
+
     return df
 
 # ───────────────────────────────────────────────────────────────────────────────
-# 데이터 선택 (Repo / 업로드)
+# 5) 데이터 불러오기(Repo/업로드)
 # ───────────────────────────────────────────────────────────────────────────────
 st.sidebar.header("데이터")
 use_repo = st.sidebar.radio("불러오기 방식", ["Repo 내 파일", "CSV 업로드"], index=0)
@@ -172,33 +189,35 @@ else:
     centers = load_centers(up_c) if up_c else None
 
 # ───────────────────────────────────────────────────────────────────────────────
-# 탭
+# 6) 탭
 # ───────────────────────────────────────────────────────────────────────────────
-tab = st.radio("", ["🚴 구간(거리) 추적", "📍 인증센터"], horizontal=True, label_visibility="collapsed")
+tab = st.radio("", ["🚴 구간(거리) 추적", "📍 인증센터"],
+               horizontal=True, label_visibility="collapsed")
 
 # ───────────────────────────────────────────────────────────────────────────────
-# ① 구간(거리) 추적
+# 7) 구간(거리) 추적
 # ───────────────────────────────────────────────────────────────────────────────
 if tab == "🚴 구간(거리) 추적":
     st.sidebar.header("구간 선택")
 
-    available_cats = [c for c in CAT_LIST() if c in routes["category"].astype(str).unique()]
-    cat = st.sidebar.selectbox("대분류", options=["전체구간"] + available_cats, index=0)
+    # 카테고리 순서 고정 + 기본값을 국토종주로
+    cats = ["전체구간"] + [c for c in CAT_LIST() if c in routes["category"].unique()]
+    default_cat_index = cats.index("국토종주코스") if "국토종주코스" in cats else 0
+    cat = st.sidebar.selectbox("대분류", options=cats, index=default_cat_index)
 
     df = routes.copy()
     if cat != "전체구간":
-        df = df[df["category"].astype(str) == cat]
+        df = df[df["category"] == cat]
 
-    route_names = df["route"].dropna().unique().tolist()
-    route_names = sorted(route_names)
-    route_pick = st.sidebar.multiselect("노선(복수 선택 가능)", options=route_names, default=route_names)
+    route_names = sorted(df["route"].dropna().unique().tolist())
+    route_pick = st.sidebar.multiselect("노선(복수 선택 가능)", route_names, default=route_names)
     if not route_pick:
         st.stop()
     df = df[df["route"].isin(route_pick)].copy()
 
     # 공식 총거리 요약
     def official_total(route: str) -> float:
-        return float(OFFICIAL_TOTALS.get(route, float(routes.loc[routes["route"]==route,"distance_km"].sum())))
+        return float(OFFICIAL_TOTALS.get(route, float(routes.loc[routes["route"] == route, "distance_km"].sum())))
 
     with st.expander("선택 노선 총거리 요약", expanded=True):
         summary = pd.DataFrame({"route": route_pick, "총거리(km)": [official_total(r) for r in route_pick]})
@@ -210,12 +229,12 @@ if tab == "🚴 구간(거리) 추적":
     df["완료"] = df["id"].isin(st.session_state.done_ids)
 
     edited = st.data_editor(
-        df[["category","route","section","distance_km","완료"]].rename(columns={"distance_km":"distance_km"}),
-        use_container_width=True, hide_index=True, key="editor_routes"
+        df[["category", "route", "section", "distance_km", "완료"]],
+        use_container_width=True, hide_index=True, key="editor_routes",
     )
 
     # 반영
-    merge_key = (df["route"].astype(str) + "@" + df["section"].astype(str)).str.replace(r"\s+","",regex=True)
+    merge_key = (df["route"].astype(str) + "@" + df["section"].astype(str)).str.replace(r"\s+", "", regex=True)
     id_map = dict(zip(merge_key, df["id"]))
     new_done = set()
     for _, row in edited.iterrows():
@@ -229,17 +248,13 @@ if tab == "🚴 구간(거리) 추적":
     total_km = float(df["distance_km"].sum())
     done_km  = float(df[df["id"].isin(st.session_state.done_ids)]["distance_km"].sum())
     left_km  = max(total_km - done_km, 0.0)
-
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("선택 구간 총거리(표 합계)", f"{total_km:,.1f} km")
     c2.metric("완료 누적거리", f"{done_km:,.1f} km")
     c3.metric("남은 거리", f"{left_km:,.1f} km")
-    if len(route_pick) == 1:
-        c4.metric("공식 노선 총거리", f"{official_total(route_pick[0]):,.1f} km")
-    else:
-        c4.metric("공식 노선 총거리", "다중 선택")
+    c4.metric("공식 노선 총거리", "다중 선택" if len(route_pick)!=1 else f"{official_total(route_pick[0]):,.1f} km")
 
-    # 지도
+    # 지도(path 또는 시작/끝 좌표)
     def parse_path(s):
         try:
             val = json.loads(s)
@@ -267,7 +282,6 @@ if tab == "🚴 구간(거리) 추적":
                     "done": bool(r["id"] in st.session_state.done_ids),
                 })
     pts_df = pd.DataFrame(pts)
-
     if len(pts_df) > 0:
         center_lng, center_lat = float(pts_df["lng"].mean()), float(pts_df["lat"].mean())
     else:
@@ -275,25 +289,35 @@ if tab == "🚴 구간(거리) 추적":
 
     layers = []
     if not paths.empty:
-        paths["__color"] = paths["id"].apply(lambda x: [28,200,138] if x in st.session_state.done_ids else [230,57,70])
-        layers.append(pdk.Layer(
-            "PathLayer", paths, get_path="__path", get_color="__color",
-            width_scale=3, width_min_pixels=3, pickable=True
-        ))
+        paths["__color"] = paths["id"].apply(lambda x: [28, 200, 138] if x in st.session_state.done_ids else [230, 57, 70])
+        layers.append(
+            pdk.Layer(
+                "PathLayer",
+                paths, get_path="__path", get_color="__color",
+                width_scale=3, width_min_pixels=3, pickable=True
+            )
+        )
     if not pts_df.empty:
         pts_df["__color"] = pts_df["done"].map(lambda b: [28,200,138] if b else [230,57,70])
-        layers.append(pdk.Layer(
-            "ScatterplotLayer", pts_df, get_position='[lng, lat]',
-            get_fill_color='__color', get_radius=150, pickable=True
-        ))
+        layers.append(
+            pdk.Layer(
+                "ScatterplotLayer",
+                pts_df, get_position='[lng, lat]',
+                get_fill_color='__color', get_radius=150, pickable=True
+            )
+        )
 
-    deck = pdk.Deck(layers=layers,
-                    initial_view_state=pdk.ViewState(latitude=center_lat, longitude=center_lng, zoom=7),
-                    tooltip={"text": "{name}"})
-    st.pydeck_chart(deck, use_container_width=True)
+    st.pydeck_chart(
+        pdk.Deck(
+            layers=layers,
+            initial_view_state=pdk.ViewState(latitude=center_lat, longitude=center_lng, zoom=7),
+            tooltip={"text": "{name}"}
+        ),
+        use_container_width=True
+    )
 
 # ───────────────────────────────────────────────────────────────────────────────
-# ② 인증센터
+# 8) 인증센터 — 체크하면 누적거리 합산(좌표 없으면 자동좌표/leg_km 대체)
 # ───────────────────────────────────────────────────────────────────────────────
 else:
     if centers is None:
@@ -301,15 +325,18 @@ else:
         st.stop()
 
     st.sidebar.header("인증센터 필터")
-    available_cats = [c for c in CAT_LIST() if c in centers["category"].astype(str).unique()]
-    cat = st.sidebar.selectbox("대분류", options=["전체"] + available_cats, index=0)
+    centers["category"] = centers["route"].map(GROUP_MAP).fillna("기타코스")
+
+    cats = ["전체"] + [c for c in CAT_LIST() if c in centers["category"].unique()]
+    default_cat_index = cats.index("국토종주코스") if "국토종주코스" in cats else 0
+    cat = st.sidebar.selectbox("대분류", cats, index=default_cat_index)
 
     dfc = centers.copy()
     if cat != "전체":
-        dfc = dfc[dfc["category"].astype(str) == cat]
+        dfc = dfc[dfc["category"] == cat]
 
     route_names = sorted(dfc["route"].dropna().unique().tolist())
-    route_pick = st.sidebar.multiselect("노선(복수 선택 가능)", options=route_names, default=route_names)
+    route_pick = st.sidebar.multiselect("노선(복수 선택 가능)", route_names, default=route_names)
     if not route_pick:
         st.stop()
     dfc = dfc[dfc["route"].isin(route_pick)].copy()
@@ -317,12 +344,12 @@ else:
     if "done_center_ids" not in st.session_state:
         st.session_state.done_center_ids = set()
 
-    dfc = dfc.sort_values(["route","seq","center"], na_position="last").reset_index(drop=True)
+    dfc = dfc.sort_values(["route", "seq", "center"], na_position="last").reset_index(drop=True)
     dfc["완료"] = dfc["id"].isin(st.session_state.done_center_ids)
 
     with st.expander("인증센터 체크(간단 편집)", expanded=True):
         edited = st.data_editor(
-            dfc[["category","route","seq","center","address","완료"]],
+            dfc[["category", "route", "seq", "center", "address", "완료"]],
             use_container_width=True, hide_index=True, key="editor_centers",
         )
 
@@ -337,18 +364,19 @@ else:
     st.session_state.done_center_ids = new_done
     dfc["완료"] = dfc["id"].isin(st.session_state.done_center_ids)
 
-    # 센터 간 세그먼트 구성(거리 = leg_km > 좌표 하버사인 > 0)
+    # 세그먼트(센터 i → i+1): 거리 = leg_km > 하버사인 > 0
     seg_rows = []
     for route, g in dfc.groupby("route"):
         g = g.sort_values("seq")
         recs = g.to_dict("records")
-        for i in range(len(recs) - 1):
+        for i in range(len(recs)-1):
             a, b = recs[i], recs[i+1]
             if not pd.isna(a.get("leg_km")):
                 dist = float(a["leg_km"])
             else:
                 dist = haversine_km(a.get("lat"), a.get("lng"), b.get("lat"), b.get("lng"))
-                if pd.isna(dist): dist = 0.0
+                if pd.isna(dist):
+                    dist = 0.0
             seg_rows.append({
                 "route": route,
                 "start_center": a["center"], "end_center": b["center"],
@@ -359,7 +387,7 @@ else:
             })
     seg_df = pd.DataFrame(seg_rows)
 
-    # KPI
+    # KPI(센터 기준)
     if not seg_df.empty:
         total_km_centers = float(seg_df["distance_km"].sum())
         done_km_centers  = float(seg_df.loc[seg_df["done"], "distance_km"].sum())
@@ -373,38 +401,54 @@ else:
     c3.metric("센터 기준 누적거리", f"{done_km_centers:,.1f} km")
     c4.metric("센터 기준 남은 거리", f"{left_km_centers:,.1f} km")
 
-    # 지도(경로+마커)
+    # 지도(경로 + 마커)
     layers = []
     if not seg_df.empty:
-        for flag, color in [(True,[28,200,138]), (False,[230,57,70])]:
+        # 완료/미완료 경로 각각 다른 색상
+        for flag, color in [(True, [28,200,138]), (False, [230,57,70])]:
             src = seg_df[seg_df["done"] == flag].copy()
-            if src.empty: 
+            if src.empty:
                 continue
-            src["__path"] = src.apply(lambda r: [[r["start_lng"], r["start_lat"]],
-                                                 [r["end_lng"], r["end_lat"]]], axis=1)
+            src["__path"] = src.apply(
+                lambda r: [[r["start_lng"], r["start_lat"]], [r["end_lng"], r["end_lat"]]],
+                axis=1
+            )
             src["__color"] = [color] * len(src)
-            layers.append(pdk.Layer(
-                "PathLayer", src, get_path="__path", get_color="__color",
-                width_scale=3, width_min_pixels=3, pickable=True
-            ))
-    geo = dfc.dropna(subset=["lat","lng"]).copy()
+            layers.append(
+                pdk.Layer(
+                    "PathLayer", src, get_path="__path", get_color="__color",
+                    width_scale=3, width_min_pixels=3, pickable=True
+                )
+            )
+
+    geo = dfc.dropna(subset=["lat", "lng"]).copy()
     if not geo.empty:
         geo["__color"] = geo["완료"].map(lambda b: [28,200,138] if b else [230,57,70])
-        layers.append(pdk.Layer(
-            "ScatterplotLayer",
-            geo.rename(columns={"lat":"latitude","lng":"longitude"}),
-            get_position='[longitude, latitude]',
-            get_fill_color="__color",
-            get_radius=180, pickable=True
-        ))
-        vlat, vlng = float(geo["latitude"].mean()), float(geo["longitude"].mean())
+        geo_plot = geo.rename(columns={"lat": "latitude", "lng": "longitude"})
+        layers.append(
+            pdk.Layer(
+                "ScatterplotLayer",
+                geo_plot,
+                get_position='[longitude, latitude]',
+                get_fill_color="__color",
+                get_radius=180,
+                pickable=True
+            )
+        )
+        # ⛔️ 이전 오류 원인: 여기서 'latitude/longitude'를 찾았던 것.
+        # DataFrame은 아직 lat/lng이므로 평균은 lat/lng로 계산해야 함.
+        vlat = float(geo["lat"].mean())
+        vlng = float(geo["lng"].mean())
     else:
         vlat, vlng = 36.2, 127.5
 
-    st.pydeck_chart(pdk.Deck(
-        layers=layers,
-        initial_view_state=pdk.ViewState(latitude=vlat, longitude=vlng, zoom=7),
-        tooltip={"text": "{route}\n{start_center} → {end_center}"}
-    ), use_container_width=True)
+    st.pydeck_chart(
+        pdk.Deck(
+            layers=layers,
+            initial_view_state=pdk.ViewState(latitude=vlat, longitude=vlng, zoom=7),
+            tooltip={"text": "{route}\n{start_center} → {end_center}"}
+        ),
+        use_container_width=True
+    )
 
-    st.caption("💡 좌표가 비어도 낙동강 기본 좌표로 자동 보정합니다. centers.csv에 정확한 좌표/leg_km를 채우면 그 값을 우선 사용합니다.")
+    st.info("✅ 좌표가 비어도 낙동강 기본좌표로 자동 보정합니다. 더 정확한 값이나 구간거리(leg_km)를 centers.csv에 넣으면 그 값이 우선 적용됩니다.")
