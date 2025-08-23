@@ -286,11 +286,11 @@ if tab == "🚴 구간(거리) 추적":
             )
         )
 
-    # 센터 마커(있으면)
+    # 센터 마커(있으면) — ★ 에러 수정: 각 행에 색상 리스트 부여
     if centers is not None:
         g = centers[centers["route"].isin(route_pick)].dropna(subset=["lat","lng"]).copy()
         if not g.empty:
-            g["__color"] = [200, 200, 200]
+            g["__color"] = [[200, 200, 200]] * len(g)   # ← 여기 수정
             layers.append(
                 pdk.Layer(
                     "ScatterplotLayer",
