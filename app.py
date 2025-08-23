@@ -1,4 +1,4 @@
-# app.py — 공식거리 자동 보정 + 인증센터 기반 경로/거리 생성
+# app.py — 공식거리 자동 보정 + 인증센터 기반 경로/거리 생성 (세션/인덱서/노선단위 색칠 수정)
 from __future__ import annotations
 import json, math
 from pathlib import Path
@@ -32,7 +32,7 @@ OFFICIAL_TOTALS = {
 }
 
 # ───────────────────────────────────────────────────────────────────────────────
-# 1) 최상위 카테고리 매핑
+# 1) 카테고리
 # ───────────────────────────────────────────────────────────────────────────────
 GROUP_MAP = {
     # 국토종주코스
@@ -167,10 +167,10 @@ if tab == "🚴 구간(거리) 추적":
     # 노선 목록
     route_names = sorted(df["route"].dropna().unique().tolist())
 
-    # 👉 세션키 사전 초기화 (위젯 생성 전)
+    # 세션키 먼저 준비
     st.session_state.setdefault("route_pick", [])
 
-    # 전체 선택/해제 버튼을 먼저 처리한 뒤, 멀티셀렉트 생성
+    # 전체 선택/해제 버튼
     b1, b2 = st.sidebar.columns(2)
     if b1.button("전체 선택", use_container_width=True):
         st.session_state["route_pick"] = route_names
@@ -178,19 +178,15 @@ if tab == "🚴 구간(거리) 추적":
         st.session_state["route_pick"] = []
 
     route_pick = st.sidebar.multiselect(
-        "노선(복수 선택 가능)",
-        options=route_names,
-        key="route_pick",  # 위에서 초기화한 세션키와 동일
-        help="표시할 노선을 선택하세요.",
+        "노선(복수 선택 가능)", options=route_names, key="route_pick", help="표시할 노선을 선택하세요.",
     )
-
     if not route_pick:
         st.warning("표시할 노선을 선택하세요.")
         st.stop()
 
     df = df[df["route"].isin(route_pick)].copy()
 
-    # ── 인증센터 기반 경로/거리 생성(있을 때만)
+    # ── 인증센터 기반 파생 경로/거리
     def centers_polyline_and_km(route_name: str):
         if centers is None:
             return None, np.nan
@@ -215,7 +211,7 @@ if tab == "🚴 구간(거리) 추적":
     df["__derived_km"] = df["route"].map(lambda r: by_route.get(r, {}).get("derived_km", np.nan))
     df["__derived_path"] = df["route"].map(lambda r: by_route.get(r, {}).get("derived_path", None))
 
-    # 표시/계산에 쓸 km (우선순위: routes.distance_km > 공식거리 > centers 파생거리)
+    # km 표시(우선순위: routes.distance_km > 공식거리 > centers 파생거리)
     df["__display_km"] = np.where(
         df["distance_km"].notna() & (df["distance_km"] > 0),
         df["distance_km"],
@@ -252,6 +248,7 @@ if tab == "🚴 구간(거리) 추적":
         if _id and bool(row["완료"]):
             new_done.add(_id)
     st.session_state.done_ids = new_done
+    df["완료"] = df["id"].isin(st.session_state.done_ids)
 
     # KPI — 표시용 거리 기준
     total_km = float(df["__display_km"].sum())
@@ -267,20 +264,27 @@ if tab == "🚴 구간(거리) 추적":
     else:
         c4.metric("공식 노선 총거리", "다중 선택")
 
-    # 지도: routes.path or centers 파생 경로
-    df["__path"] = None
-    if "path" in df.columns:
-        df["__path"] = df["path"].dropna().map(parse_path)
-    df.loc[df["__path"].isna(), "__path"] = df.loc[df["__path"].isna(), "__derived_path"]
+    # ── 지도: "노선 단위"로 1번만 그리기 + 색상은 노선 안에 '완료'가 하나라도 있으면 초록
+    #          (부분 구간 색칠은 📍인증센터 탭에서 센터 간 구간별로 보세요)
+    draw_rows = []
+    for route_name, g in df.groupby("route"):
+        path = g["__path"].dropna().map(parse_path).dropna().iloc[0] if "path" in g.columns and g["path"].notna().any() else None
+        if path is None:
+            # routes.path 없으면 centers 파생 경로 사용
+            path = g["__derived_path"].dropna().iloc[0] if g["__derived_path"].notna().any() else None
+        if path is None:
+            continue
+        done_any = bool(g["완료"].any())
+        color = [28, 200, 138] if done_any else [230, 57, 70]
+        draw_rows.append({"route": route_name, "path": path, "__color": color})
 
     layers = []
-    paths_df = df.dropna(subset=["__path"]).copy()
-    if not paths_df.empty:
-        paths_df["__color"] = paths_df["id"].apply(lambda x: [28, 200, 138] if x in st.session_state.done_ids else [230, 57, 70])
+    if draw_rows:
+        paths_df = pd.DataFrame(draw_rows)
         layers.append(
             pdk.Layer(
                 "PathLayer",
-                paths_df.rename(columns={"__path": "path"}),
+                paths_df,
                 get_path="path",
                 get_color="__color",
                 width_scale=3,
@@ -316,7 +320,7 @@ if tab == "🚴 구간(거리) 추적":
         pdk.Deck(
             layers=layers,
             initial_view_state=pdk.ViewState(latitude=center_lat, longitude=center_lng, zoom=7),
-            tooltip={"text": "{route} / {section}"},
+            tooltip={"text": "{route}"},
         ),
         use_container_width=True,
     )
@@ -341,11 +345,9 @@ else:
     if cat != "전체":
         dfc = dfc[dfc["category"] == cat]
 
-    # 목록 & 세션키 초기화
     route_names = sorted(dfc["route"].dropna().unique().tolist())
     st.session_state.setdefault("center_route_pick", [])
 
-    # 버튼 먼저 → 위젯
     b1, b2 = st.sidebar.columns(2)
     if b1.button("전체 선택", use_container_width=True, key="center_sel_all"):
         st.session_state["center_route_pick"] = route_names
@@ -353,10 +355,7 @@ else:
         st.session_state["center_route_pick"] = []
 
     route_pick = st.sidebar.multiselect(
-        "노선(복수 선택 가능)",
-        options=route_names,
-        key="center_route_pick",
-        help="인증센터를 확인할 노선을 선택하세요.",
+        "노선(복수 선택 가능)", options=route_names, key="center_route_pick", help="인증센터를 확인할 노선을 선택하세요.",
     )
     if not route_pick:
         st.warning("노선을 선택하세요.")
@@ -371,8 +370,9 @@ else:
     dfc["완료"] = dfc["id"].isin(st.session_state.done_center_ids)
 
     with st.expander("인증센터 체크(간단 편집)", expanded=True):
+        # 🔧 BUGFIX: set(...)이 아니라 list([...]) 인덱서 사용
         edited = st.data_editor(
-            dfc[{"category", "route", "seq", "center", "address", "완료"}],
+            dfc[["category", "route", "seq", "center", "address", "완료"]],
             use_container_width=True,
             hide_index=True,
             key="editor_centers",
