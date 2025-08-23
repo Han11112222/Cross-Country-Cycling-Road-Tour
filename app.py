@@ -1,4 +1,4 @@
-# app.py — 공식거리 자동 보정 + 인증센터 기반 경로/거리 생성 (선택 기본값 해제 + 전체선택/해제 버튼)
+# app.py — 공식거리 자동 보정 + 인증센터 기반 경로/거리 생성
 from __future__ import annotations
 import json, math
 from pathlib import Path
@@ -10,7 +10,7 @@ import pydeck as pdk
 st.set_page_config(page_title="국토종주 누적거리 트래커", layout="wide")
 
 # ───────────────────────────────────────────────────────────────────────────────
-# 0) 공식 총거리(자전거행복나눔 기준) — 표/누적 계산에 사용(거리 0일 때 자동 대체)
+# 0) 공식 총거리(자전거행복나눔 기준)
 # ───────────────────────────────────────────────────────────────────────────────
 OFFICIAL_TOTALS = {
     # 국토종주
@@ -55,7 +55,7 @@ GROUP_MAP = {
 TOP_ORDER = ["국토종주코스", "제주환상자전거길", "그랜드슬램코스", "기타코스"]
 
 # ───────────────────────────────────────────────────────────────────────────────
-# 2) 기초 유틸
+# 2) 유틸
 # ───────────────────────────────────────────────────────────────────────────────
 def haversine_km(lat1, lon1, lat2, lon2):
     if any(pd.isna([lat1, lon1, lat2, lon2])):
@@ -164,22 +164,25 @@ if tab == "🚴 구간(거리) 추적":
     if cat != "전체구간":
         df = df[df["category"] == cat]
 
-    # 노선 멀티셀렉트(기본값: 선택 없음)
+    # 노선 목록
     route_names = sorted(df["route"].dropna().unique().tolist())
+
+    # 👉 세션키 사전 초기화 (위젯 생성 전)
+    st.session_state.setdefault("route_pick", [])
+
+    # 전체 선택/해제 버튼을 먼저 처리한 뒤, 멀티셀렉트 생성
+    b1, b2 = st.sidebar.columns(2)
+    if b1.button("전체 선택", use_container_width=True):
+        st.session_state["route_pick"] = route_names
+    if b2.button("전체 해제", use_container_width=True):
+        st.session_state["route_pick"] = []
+
     route_pick = st.sidebar.multiselect(
         "노선(복수 선택 가능)",
         options=route_names,
-        default=[],
-        key="route_multi",
+        key="route_pick",  # 위에서 초기화한 세션키와 동일
         help="표시할 노선을 선택하세요.",
     )
-    c1, c2 = st.sidebar.columns(2)
-    if c1.button("전체 선택"):
-        st.session_state.route_multi = route_names
-        route_pick = route_names
-    if c2.button("전체 해제"):
-        st.session_state.route_multi = []
-        route_pick = []
 
     if not route_pick:
         st.warning("표시할 노선을 선택하세요.")
@@ -286,7 +289,7 @@ if tab == "🚴 구간(거리) 추적":
             )
         )
 
-    # 센터 마커(있으면) — 각 행에 색상 배열 부여
+    # 센터 마커(있으면)
     if centers is not None:
         g = centers[centers["route"].isin(route_pick)].dropna(subset=["lat", "lng"]).copy()
         if not g.empty:
@@ -338,23 +341,23 @@ else:
     if cat != "전체":
         dfc = dfc[dfc["category"] == cat]
 
-    # 노선 멀티셀렉트(기본값: 선택 없음)
+    # 목록 & 세션키 초기화
     route_names = sorted(dfc["route"].dropna().unique().tolist())
+    st.session_state.setdefault("center_route_pick", [])
+
+    # 버튼 먼저 → 위젯
+    b1, b2 = st.sidebar.columns(2)
+    if b1.button("전체 선택", use_container_width=True, key="center_sel_all"):
+        st.session_state["center_route_pick"] = route_names
+    if b2.button("전체 해제", use_container_width=True, key="center_sel_none"):
+        st.session_state["center_route_pick"] = []
+
     route_pick = st.sidebar.multiselect(
         "노선(복수 선택 가능)",
         options=route_names,
-        default=[],
-        key="center_route_multi",
+        key="center_route_pick",
         help="인증센터를 확인할 노선을 선택하세요.",
     )
-    c1, c2 = st.sidebar.columns(2)
-    if c1.button("전체 선택", key="center_all"):
-        st.session_state.center_route_multi = route_names
-        route_pick = route_names
-    if c2.button("전체 해제", key="center_none"):
-        st.session_state.center_route_multi = []
-        route_pick = []
-
     if not route_pick:
         st.warning("노선을 선택하세요.")
         st.stop()
@@ -369,7 +372,7 @@ else:
 
     with st.expander("인증센터 체크(간단 편집)", expanded=True):
         edited = st.data_editor(
-            dfc[["category", "route", "seq", "center", "address", "완료"]],
+            dfc[{"category", "route", "seq", "center", "address", "완료"}],
             use_container_width=True,
             hide_index=True,
             key="editor_centers",
@@ -435,20 +438,10 @@ else:
             src = seg_df[seg_df["done"] == flag].copy()
             if src.empty:
                 continue
-            src["__path"] = src.apply(
-                lambda r: [[r["start_lng"], r["start_lat"]], [r["end_lng"], r["end_lat"]]], axis=1
-            )
+            src["__path"] = src.apply(lambda r: [[r["start_lng"], r["start_lat"]], [r["end_lng"], r["end_lat"]]], axis=1)
             src["__color"] = [color] * len(src)
             layers.append(
-                pdk.Layer(
-                    "PathLayer",
-                    src,
-                    get_path="__path",
-                    get_color="__color",
-                    width_scale=3,
-                    width_min_pixels=3,
-                    pickable=True,
-                )
+                pdk.Layer("PathLayer", src, get_path="__path", get_color="__color", width_scale=3, width_min_pixels=3, pickable=True)
             )
 
     geo = dfc.dropna(subset=["lat", "lng"]).copy()
