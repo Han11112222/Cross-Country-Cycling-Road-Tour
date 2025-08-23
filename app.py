@@ -15,46 +15,58 @@ st.set_page_config(page_title="국토종주 누적거리 트래커", layout="wid
 @st.cache_data
 def load_routes(src: str | Path | bytes) -> pd.DataFrame:
     df = pd.read_csv(src) if isinstance(src, (str, Path)) else pd.read_csv(src)
+
     need = {"category", "route", "section", "distance_km"}
     miss = need - set(df.columns)
     if miss:
         raise ValueError(f"routes.csv에 다음 컬럼이 필요합니다: {sorted(miss)}")
 
-    # 문자열/숫자 정리
+    # 문자열/숫자 정리 (⚠️ .strip 대신 .str.strip 사용)
     for c in ["category", "route", "section", "start", "end"]:
         if c in df.columns:
-            df[c] = df[c].astype(str).strip()
+            df[c] = df[c].astype("string").fillna("").str.strip()
+
     for c in ["distance_km", "start_lat", "start_lng", "end_lat", "end_lng"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
     # id 없으면 route+section으로 생성
     if "id" not in df.columns:
-        df["id"] = (df["route"].astype(str) + "@" + df["section"].astype(str)).str.replace(r"\s+", "", regex=True)
+        df["id"] = (df["route"].astype("string") + "@" + df["section"].astype("string")).str.replace(r"\s+", "", regex=True)
+    else:
+        # 공백/NaN id 보강
+        mask = df["id"].astype("string").fillna("").str.strip().eq("")
+        df.loc[mask, "id"] = (df.loc[mask, "route"].astype("string") + "@" +
+                              df.loc[mask, "section"].astype("string")).str.replace(r"\s+", "", regex=True)
+
     return df
 
 
 @st.cache_data
 def load_centers(src: str | Path | bytes) -> pd.DataFrame:
     df = pd.read_csv(src) if isinstance(src, (str, Path)) else pd.read_csv(src)
+
     need = {"category", "route", "center", "address", "lat", "lng"}
     miss = need - set(df.columns)
     if miss:
         raise ValueError(f"centers.csv에 다음 컬럼이 필요합니다: {sorted(miss)}")
 
-    for c in ["category", "route", "center", "address", "id"]:
+    for c in ["category", "route", "center", "address"]:
         if c in df.columns:
-            df[c] = df[c].astype(str).str.strip()
+            df[c] = df[c].astype("string").fillna("").str.strip()
+    if "id" in df.columns:
+        df["id"] = df["id"].astype("string").fillna("").str.strip()
+
     for c in ["lat", "lng"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # id 없으면 route+center로 생성
-    if "id" not in df.columns or df["id"].isna().any():
-        df["id"] = np.where(
-            df.get("id").isna() if "id" in df.columns else True,
-            (df["route"] + "@" + df["center"]).str.replace(r"\s+", "", regex=True),
-            df.get("id", "")
-        )
+    # id 없거나 비어있으면 route@center 로 생성
+    if "id" not in df.columns:
+        df["id"] = (df["route"] + "@" + df["center"]).str.replace(r"\s+", "", regex=True)
+    else:
+        mask = df["id"].astype("string").fillna("").str.strip().eq("")
+        df.loc[mask, "id"] = (df.loc[mask, "route"] + "@" + df.loc[mask, "center"]).str.replace(r"\s+", "", regex=True)
+
     return df
 
 
@@ -84,10 +96,12 @@ else:
 # --------------------------------------------------
 # 상단 탭
 # --------------------------------------------------
-tab = st.radio("",
-               ["🚴 구간(거리) 추적", "📍 인증센터"],
-               horizontal=True,
-               label_visibility="collapsed")
+tab = st.radio(
+    "",
+    ["🚴 구간(거리) 추적", "📍 인증센터"],
+    horizontal=True,
+    label_visibility="collapsed"
+)
 
 # --------------------------------------------------
 # ① 구간(거리) 추적
@@ -107,15 +121,17 @@ if tab == "🚴 구간(거리) 추적":
         st.stop()
     df = df[df["route"].isin(route_pick)].copy()
 
-    # 노선별 총거리(원 데이터 기준) – 단일 노선만 선택된 경우 보여줌
+    # 단일 노선이면 원본 기준 총거리 보여주기
     if len(route_pick) == 1:
         total_route_km = float(routes[routes["route"] == route_pick[0]]["distance_km"].sum())
-        st.caption(f"🔎 필터: 카테고리 **{cat}**, 노선 **{', '.join(route_pick)}**  ·  "
-                   f"**{route_pick[0]} 총 거리:** {total_route_km:,.1f} km")
+        st.caption(
+            f"🔎 필터: 카테고리 **{cat}**, 노선 **{', '.join(route_pick)}**  ·  "
+            f"**{route_pick[0]} 총 거리:** {total_route_km:,.1f} km"
+        )
     else:
         st.caption(f"🔎 필터: 카테고리 **{cat}**, 노선 **{', '.join(route_pick)}**")
 
-    # 진행 상태
+    # 진행 상태(체크박스)
     if "done_ids" not in st.session_state:
         st.session_state.done_ids = set()
     df["완료"] = df["id"].isin(st.session_state.done_ids)
@@ -127,8 +143,8 @@ if tab == "🚴 구간(거리) 추적":
         key="editor_routes",
     )
 
-    # 에디터 결과 → 상태 반영
-    merge_key = (df["route"].astype(str) + "@" + df["section"].astype(str)).str.replace(r"\s+", "", regex=True)
+    # 에디터 결과 반영
+    merge_key = (df["route"].astype("string") + "@" + df["section"].astype("string")).str.replace(r"\s+", "", regex=True)
     id_map = dict(zip(merge_key, df["id"]))
     new_done = set()
     for _, row in edited.iterrows():
@@ -151,6 +167,9 @@ if tab == "🚴 구간(거리) 추적":
     # 지도
     def parse_path(s):
         try:
+            s = str(s)
+            if not s or s == "nan":
+                return None
             val = json.loads(s)
             if isinstance(val, list):
                 return val
@@ -160,7 +179,7 @@ if tab == "🚴 구간(거리) 추적":
 
     df["__path"] = None
     if "path" in df.columns:
-        df["__path"] = df["path"].dropna().map(parse_path)
+        df["__path"] = df["path"].apply(parse_path)
 
     paths = df[df["__path"].notna()].copy()
 
@@ -195,7 +214,7 @@ if tab == "🚴 구간(거리) 추적":
         ))
 
     if not pts_df.empty:
-        pts_df["__color"] = pts_df["done"].map(lambda b: [28,200,138] if b else [230,57,70])
+        pts_df["__color"] = pts_df["done"].map(lambda b: [28, 200, 138] if b else [230, 57, 70])
         layers.append(pdk.Layer(
             "ScatterplotLayer",
             pts_df, get_position='[lng, lat]', get_fill_color='__color',
@@ -263,13 +282,19 @@ else:
         view = pdk.ViewState(latitude=float(geo["lat"].mean()), longitude=float(geo["lng"].mean()), zoom=7)
         layer = pdk.Layer(
             "ScatterplotLayer",
-            geo.rename(columns={"lat":"latitude","lng":"longitude"}),
+            geo.rename(columns={"lat": "latitude", "lng": "longitude"}),
             get_position='[longitude, latitude]',
             get_fill_color="__color",
             get_radius=180,
             pickable=True,
         )
-        st.pydeck_chart(pdk.Deck(layers=[layer], initial_view_state=view,
-                                 tooltip={"text": "{route} / {center}\n{address}"}), use_container_width=True)
+        st.pydeck_chart(
+            pdk.Deck(
+                layers=[layer],
+                initial_view_state=view,
+                tooltip={"text": "{route} / {center}\n{address}"}
+            ),
+            use_container_width=True
+        )
     else:
         st.info("이 필터에는 좌표(lat,lng)가 있는 인증센터가 없습니다. centers.csv 에 좌표를 채워 넣으면 지도에 표시됩니다.")
