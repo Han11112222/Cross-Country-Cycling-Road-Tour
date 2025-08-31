@@ -1,4 +1,4 @@
-# app.py — v21: 인증센터 온더플라이 지오코딩 + 인덱스 안전 반영 + 기본 회색/완료 빨강 강조
+# app.py — v22: 인증센터 폴백-보간 좌표 + 온더플라이 지오코딩 + 인덱스 안전 반영
 from __future__ import annotations
 import json, math, time
 from pathlib import Path
@@ -8,7 +8,7 @@ import streamlit as st
 import pydeck as pdk
 import requests
 
-BUILD_TAG = "2025-09-01-v21"
+BUILD_TAG = "2025-09-01-v22"
 st.set_page_config(page_title="국토종주 누적거리 트래커", layout="wide")
 st.caption(f"BUILD: {BUILD_TAG}")
 
@@ -54,7 +54,7 @@ ALL_DEFINED_ROUTES = sorted({
 ROUTE_TO_BIG = {norm_name(r): big for big, rs in BIG_TO_ROUTES.items() for r in rs}
 
 # ─────────────────────────────────────────────────────────────
-# 폴백 경로([lng,lat])
+# 폴백 경로([lng,lat]) — 데이터 없을 때 회색 기준선 및 인증센터 임시보간에 사용
 # ─────────────────────────────────────────────────────────────
 _raw_fb = {
     "아라자전거길": [[126.58, 37.60], [126.68, 37.60], [126.82, 37.57]],
@@ -74,7 +74,7 @@ _raw_fb = {
 FALLBACK_PATHS = {norm_name(k): v for k, v in _raw_fb.items()}
 
 # ─────────────────────────────────────────────────────────────
-# 유틸/지오코딩
+# 유틸/지오코딩/보간
 # ─────────────────────────────────────────────────────────────
 def haversine_km(a,b,c,d):
     if any(pd.isna([a,b,c,d])): return np.nan
@@ -162,6 +162,45 @@ def make_geojson_lines(line_items):
         })
     return {"type":"FeatureCollection","features":feats}
 
+def _interp_on_polyline(path_lnglat, t: float):
+    """path: [[lng,lat],...] / t in [0,1] → (lat,lng) 보간"""
+    if not path_lnglat or len(path_lnglat)<2: return None,None
+    # 누적 길이
+    cum=[0.0]
+    for i in range(len(path_lnglat)-1):
+        a,b=path_lnglat[i],path_lnglat[i+1]
+        cum.append(cum[-1]+(haversine_km(a[1],a[0],b[1],b[0]) or 0.0))
+    L=cum[-1] if cum[-1]>0 else 1.0
+    s=t*L
+    j=0
+    while j<len(cum)-1 and cum[j+1] < s: j+=1
+    if j>=len(path_lnglat)-1: j=len(path_lnglat)-2
+    a,b=path_lnglat[j], path_lnglat[j+1]
+    dseg=(cum[j+1]-cum[j]) or 1.0
+    ratio=max(0.0, min(1.0, (s-cum[j])/dseg))
+    lng=a[0] + (b[0]-a[0])*ratio
+    lat=a[1] + (b[1]-a[1])*ratio
+    return lat, lng
+
+def fill_missing_centers_with_fallback(dfg: pd.DataFrame, route_name: str):
+    """dfg: 단일 route의 df (lat/lng 결측인 행을 seq 비율 기준 폴백 경로로 보간)"""
+    if route_name not in FALLBACK_PATHS: return dfg
+    path = FALLBACK_PATHS[route_name]
+    if not isinstance(path, list) or len(path)<2: return dfg
+    mask = dfg["lat"].isna() | dfg["lng"].isna()
+    if not mask.any(): return dfg
+    # seq를 이용해 0..1 사이 위치 할당 (동일 간격)
+    order = dfg["seq"].rank(method="dense").astype(int)
+    n = max(int(order.max()), 1)
+    for idx in dfg[mask].index:
+        k = int(order.loc[idx]) - 1
+        t = 0.0 if n==1 else k / (n-1)
+        lat, lng = _interp_on_polyline(path, t)
+        if lat is not None and lng is not None:
+            dfg.at[idx,"lat"] = lat
+            dfg.at[idx,"lng"] = lng
+    return dfg
+
 # ─────────────────────────────────────────────────────────────
 # CSV 로딩
 # ─────────────────────────────────────────────────────────────
@@ -201,7 +240,7 @@ def load_centers(src, auto_geo: bool):
             lat,lng=geocode(row["address"])
             if lat is not None and lng is not None:
                 df.at[i,"lat"], df.at[i,"lng"]=lat,lng
-                time.sleep(1.0)
+                time.sleep(1.0)  # OSM rate-limit 보호
     df["big"]=df["route"].map(ROUTE_TO_BIG).fillna("기타")
     df["big"]=pd.Categorical(df["big"],categories=TOP_ORDER,ordered=True)
     return df
@@ -230,7 +269,6 @@ else:
 st.session_state.setdefault("done_section_ids", set())
 st.session_state.setdefault("done_center_ids", set())
 
-# 색상
 BASE_GRAY = [190,190,190]
 HIGHLIGHT_COLOR = [230, 57, 70]
 ROUTE_COLORS = {r: BASE_GRAY for r in ALL_DEFINED_ROUTES}
@@ -385,7 +423,7 @@ if tab=="🚴 구간(거리) 추적":
                     use_container_width=True)
 
 # ─────────────────────────────────────────────────────────────
-# 2) 인증센터 — 온더플라이 지오코딩 + 인덱스 안전 반영 + 기본 회색/완료 빨강
+# 2) 인증센터 — 온더플라이 지오코딩 + 폴백 좌표 보간 + 기본 회색/완료 빨강
 # ─────────────────────────────────────────────────────────────
 else:
     if centers is None:
@@ -397,12 +435,17 @@ else:
     dfc=centers[centers["route"].isin(picked)].copy()
     dfc=dfc.sort_values(["route","seq","center"]).reset_index(drop=True)
 
-    # ▶ 여기서 화면에 보이는 행만 지오코딩으로 즉시 보정
+    # (1) 온더플라이 지오코딩
     need_geo = dfc["address"].notna() & (dfc["lat"].isna() | dfc["lng"].isna())
     for idx, row in dfc[need_geo].iterrows():
         lat, lng = geocode(row["address"])
         if lat is not None and lng is not None:
             dfc.at[idx,"lat"], dfc.at[idx,"lng"] = lat, lng
+
+    # (2) 여전히 비어 있으면 폴백 경로로 seq 비율 보간하여 임시 좌표 생성
+    for r, g in dfc.groupby("route"):
+        if (g["lat"].isna() | g["lng"].isna()).any():
+            dfc.loc[g.index] = fill_missing_centers_with_fallback(g.copy(), r)
 
     dfc["완료"]=dfc["id"].isin(st.session_state.done_center_ids)
 
@@ -413,7 +456,7 @@ else:
             column_config={"완료": st.column_config.CheckboxColumn(label="완료", default=False)}
         )
 
-    # ▶ 인덱스(label) 기반으로 안전하게 반영 (정렬/필터해도 OK)
+    # 인덱스(label) 기반 안전 반영
     new_done=set()
     for i,_row in edited.iterrows():
         cid=dfc.loc[i,"id"]
@@ -440,8 +483,8 @@ else:
                 "distance_km":0.0 if pd.isna(dist) else float(dist),
                 "done":bool(a["완료"] and b["완료"]),
             })
-
     seg_df=pd.DataFrame(seg)
+
     total=float(seg_df["distance_km"].sum()) if not seg_df.empty else 0.0
     done=float(seg_df.loc[seg_df["done"],"distance_km"].sum()) if not seg_df.empty else 0.0
     left=max(total-done,0.0)
@@ -452,7 +495,21 @@ else:
     c3.metric("센터 기준 누적거리", f"{done:,.1f} km")
     c4.metric("센터 기준 남은 거리", f"{left:,.1f} km")
 
+    # 지도 레이어: (a) 노선 폴백 라인(밑그림), (b) 세그먼트 전체 회색, (c) 완료 세그먼트 빨강, (d) 센터 점(회색/빨강)
     layers=[]
+
+    # (a) 밑그림: 선택 노선 폴백 라인(있으면)
+    fb_rows=[{"route": r, "path": FALLBACK_PATHS[r], "color": [80,80,80], "width": 3}
+             for r in picked if r in FALLBACK_PATHS and len(FALLBACK_PATHS[r])>=2]
+    if fb_rows:
+        gj_fb=make_geojson_lines(fb_rows)
+        if gj_fb["features"]:
+            layers.append(pdk.Layer("GeoJsonLayer", gj_fb, pickable=False,
+                                    get_line_color="properties.color",
+                                    get_line_width="properties.width",
+                                    line_width_min_pixels=3))
+
+    # (b)(c) 세그먼트
     if not seg_df.empty:
         gj_all=make_geojson_lines([{"route": r["route"], "path": r["path"], "color": BASE_GRAY, "width": 4}
                                    for _, r in seg_df.iterrows()])
@@ -469,6 +526,7 @@ else:
                                     get_line_width="properties.width",
                                     line_width_min_pixels=6))
 
+    # (d) 센터 점
     geo=dfc.dropna(subset=["lat","lng"]).copy()
     if not geo.empty:
         geo["__color"]=[BASE_GRAY]*len(geo)
