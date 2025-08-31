@@ -1,4 +1,4 @@
-# app.py — v19: view_from 안정화 (빈/단일/비정상 좌표 방어), 구간/인증센터 동작은 동일
+# app.py — v21: 인증센터 온더플라이 지오코딩 + 인덱스 안전 반영 + 기본 회색/완료 빨강 강조
 from __future__ import annotations
 import json, math, time
 from pathlib import Path
@@ -8,7 +8,7 @@ import streamlit as st
 import pydeck as pdk
 import requests
 
-BUILD_TAG = "2025-09-01-v19"
+BUILD_TAG = "2025-09-01-v21"
 st.set_page_config(page_title="국토종주 누적거리 트래커", layout="wide")
 st.caption(f"BUILD: {BUILD_TAG}")
 
@@ -40,7 +40,6 @@ TOP_ORDER = ["국토종주", "4대강 종주", "그랜드슬램", "제주환상"
 BIG_TO_ROUTES = {
     "국토종주": ["아라자전거길","한강종주자전거길(서울구간)","남한강자전거길","새재자전거길","낙동강자전거길"],
     "4대강 종주": ["한강종주자전거길(서울구간)","금강자전거길","영산강자전거길","낙동강자전거길"],
-    # 그랜드슬램은 아래 pick_by_big에서 "전체"로 처리
     "제주환상": ["제주환상","제주환상자전거길"],
 }
 def norm_name(s: str) -> str:
@@ -52,11 +51,10 @@ ALL_DEFINED_ROUTES = sorted({
     "금강자전거길","영산강자전거길","북한강자전거길","섬진강자전거길","오천자전거길",
     "동해안자전거길(강원구간)","동해안자전거길(경북구간)","제주환상","제주환상자전거길"
 })
-
 ROUTE_TO_BIG = {norm_name(r): big for big, rs in BIG_TO_ROUTES.items() for r in rs}
 
 # ─────────────────────────────────────────────────────────────
-# 폴백 경로([lng,lat]) — 데이터 없을 때 회색 기준선용
+# 폴백 경로([lng,lat])
 # ─────────────────────────────────────────────────────────────
 _raw_fb = {
     "아라자전거길": [[126.58, 37.60], [126.68, 37.60], [126.82, 37.57]],
@@ -110,10 +108,8 @@ def geocode(addr:str):
     return None,None
 
 def _append_path_points(pts, p):
-    """p가 [[lng,lat],...] 또는 [lng,lat] 둘 다 안전하게 처리하여 pts에 [lat,lng]로 추가"""
     if not isinstance(p, (list, tuple)) or len(p)==0:
         return
-    # 한 점만 [lng,lat] 형태일 수도 있음
     if len(p)==2 and all(isinstance(v,(int,float)) for v in p):
         candidates = [p]
     else:
@@ -122,7 +118,7 @@ def _append_path_points(pts, p):
         try:
             lng, lat = float(xy[0]), float(xy[1])
             if not (pd.isna(lat) or pd.isna(lng)):
-                pts.append([lat, lng])   # [lat,lng]
+                pts.append([lat, lng])
         except Exception:
             continue
 
@@ -130,7 +126,6 @@ def view_from(paths, centers_df, base_zoom: float):
     pts=[]
     for p in (paths or []):
         _append_path_points(pts, p)
-    # 인증센터도 반영
     try:
         if centers_df is not None and hasattr(centers_df, "empty") and not centers_df.empty:
             for lat, lng in centers_df[["lat","lng"]].dropna().astype(float).values.tolist():
@@ -138,20 +133,14 @@ def view_from(paths, centers_df, base_zoom: float):
                     pts.append([lat,lng])
     except Exception:
         pass
-
     if pts:
         arr=np.array(pts, dtype=float)
-        if arr.ndim==1:
-            arr=arr.reshape(1,-1)
-        # 형상이 (N,2)가 아니면 안전 기본값
+        if arr.ndim==1: arr=arr.reshape(1,-1)
         if arr.shape[1] != 2:
             return 36.2, 127.5, base_zoom
         vlat=float(arr[:,0].mean()); vlng=float(arr[:,1].mean())
-        if arr.shape[0] > 1:
-            span_lat=float(np.ptp(arr[:,0])); span_lng=float(np.ptp(arr[:,1]))
-            span=max(span_lat, span_lng)
-        else:
-            span=0.0
+        span = max(float(np.ptp(arr[:,0])) if arr.shape[0]>1 else 0.0,
+                   float(np.ptp(arr[:,1])) if arr.shape[0]>1 else 0.0)
         zoom = 6.0 if span>3 else base_zoom
         return vlat, vlng, zoom
     return 36.2, 127.5, base_zoom
@@ -243,7 +232,7 @@ st.session_state.setdefault("done_center_ids", set())
 
 # 색상
 BASE_GRAY = [190,190,190]
-HIGHLIGHT_COLOR = [230, 57, 70]  # 체크 시 강조(빨강)
+HIGHLIGHT_COLOR = [230, 57, 70]
 ROUTE_COLORS = {r: BASE_GRAY for r in ALL_DEFINED_ROUTES}
 
 # ─────────────────────────────────────────────────────────────
@@ -363,28 +352,17 @@ if tab=="🚴 구간(거리) 추적":
     gj_base = make_geojson_lines(base_rows)
     gj_high = make_geojson_lines(highlight_rows)
 
-    if show_debug:
-        st.write({
-            "base_features": len(gj_base["features"]),
-            "highlight_features": len(gj_high["features"]),
-            "done_routes": sorted(list(done_routes)),
-        })
-
     layers=[]
     if gj_base["features"]:
-        layers.append(pdk.Layer(
-            "GeoJsonLayer", gj_base, pickable=True,
-            get_line_color="properties.color",
-            get_line_width="properties.width",
-            line_width_min_pixels=5,
-        ))
+        layers.append(pdk.Layer("GeoJsonLayer", gj_base, pickable=True,
+                                get_line_color="properties.color",
+                                get_line_width="properties.width",
+                                line_width_min_pixels=5))
     if gj_high["features"]:
-        layers.append(pdk.Layer(
-            "GeoJsonLayer", gj_high, pickable=True,
-            get_line_color="properties.color",
-            get_line_width="properties.width",
-            line_width_min_pixels=9,
-        ))
+        layers.append(pdk.Layer("GeoJsonLayer", gj_high, pickable=True,
+                                get_line_color="properties.color",
+                                get_line_width="properties.width",
+                                line_width_min_pixels=9))
 
     centers_for_view=None
     if centers is not None:
@@ -398,18 +376,16 @@ if tab=="🚴 구간(거리) 추적":
                 get_position='[longitude, latitude]',
                 get_fill_color="__color",
                 get_radius=120,
-                pickable=True,
-            ))
+                pickable=True))
 
     vlat, vlng, vzoom = view_from(view_paths, centers_for_view, base_zoom=7.0 if len(picked)==1 else 5.8)
-    st.pydeck_chart(pdk.Deck(
-        layers=layers,
-        initial_view_state=pdk.ViewState(latitude=vlat, longitude=vlng, zoom=vzoom),
-        tooltip={"text": "{properties.route}"},
-    ), use_container_width=True)
+    st.pydeck_chart(pdk.Deck(layers=layers,
+                             initial_view_state=pdk.ViewState(latitude=vlat, longitude=vlng, zoom=vzoom),
+                             tooltip={"text": "{properties.route}"}),
+                    use_container_width=True)
 
 # ─────────────────────────────────────────────────────────────
-# 2) 인증센터
+# 2) 인증센터 — 온더플라이 지오코딩 + 인덱스 안전 반영 + 기본 회색/완료 빨강
 # ─────────────────────────────────────────────────────────────
 else:
     if centers is None:
@@ -420,6 +396,14 @@ else:
 
     dfc=centers[centers["route"].isin(picked)].copy()
     dfc=dfc.sort_values(["route","seq","center"]).reset_index(drop=True)
+
+    # ▶ 여기서 화면에 보이는 행만 지오코딩으로 즉시 보정
+    need_geo = dfc["address"].notna() & (dfc["lat"].isna() | dfc["lng"].isna())
+    for idx, row in dfc[need_geo].iterrows():
+        lat, lng = geocode(row["address"])
+        if lat is not None and lng is not None:
+            dfc.at[idx,"lat"], dfc.at[idx,"lng"] = lat, lng
+
     dfc["완료"]=dfc["id"].isin(st.session_state.done_center_ids)
 
     with st.expander("인증센터 체크(간단 편집)", expanded=True):
@@ -429,9 +413,10 @@ else:
             column_config={"완료": st.column_config.CheckboxColumn(label="완료", default=False)}
         )
 
+    # ▶ 인덱스(label) 기반으로 안전하게 반영 (정렬/필터해도 OK)
     new_done=set()
     for i,_row in edited.iterrows():
-        cid=dfc.iloc[i]["id"]
+        cid=dfc.loc[i,"id"]
         if bool(_row["완료"]): new_done.add(cid)
     if new_done != st.session_state.done_center_ids:
         st.session_state.done_center_ids=new_done
@@ -439,14 +424,15 @@ else:
 
     dfc["완료"]=dfc["id"].isin(st.session_state.done_center_ids)
 
+    # 센터 → 구간(세그먼트)
     seg=[]
     for r,g in dfc.groupby("route"):
-        g=g.sort_values("seq"); rec=g.to_dict("records")
+        g=g.sort_values("seq").dropna(subset=["lat","lng"])
+        rec=g.to_dict("records")
         for i in range(len(rec)-1):
             a,b=rec[i],rec[i+1]
-            if pd.isna(a.get("lat")) or pd.isna(a.get("lng")) or pd.isna(b.get("lat")) or pd.isna(b.get("lng")):
-                continue
-            dist=float(a.get("leg_km")) if not pd.isna(a.get("leg_km")) else (haversine_km(a.get("lat"),a.get("lng"),b.get("lat"),b.get("lng")) or 0.0)
+            dist = (float(a.get("leg_km")) if ("leg_km" in g.columns and not pd.isna(a.get("leg_km")))
+                    else (haversine_km(a.get("lat"),a.get("lng"),b.get("lat"),b.get("lng")) or 0.0))
             seg.append({
                 "route":r,
                 "start_center":a["center"],"end_center":b["center"],
@@ -466,49 +452,42 @@ else:
     c3.metric("센터 기준 누적거리", f"{done:,.1f} km")
     c4.metric("센터 기준 남은 거리", f"{left:,.1f} km")
 
-    done_items=[{"route": r["route"], "path": r["path"], "color": HIGHLIGHT_COLOR, "width": 4}
-                for _, r in seg_df[seg_df["done"]].iterrows()]
-    todo_items=[{"route": r["route"], "path": r["path"], "color": BASE_GRAY, "width": 4}
-                for _, r in seg_df[~seg_df["done"]].iterrows()]
-    gj_done=make_geojson_lines(done_items)
-    gj_todo=make_geojson_lines(todo_items)
-
-    if show_debug:
-        st.write({
-            "center_segments_total": len(seg_df),
-            "gj_done_features": len(gj_done["features"]),
-            "gj_todo_features": len(gj_todo["features"]),
-        })
-
     layers=[]
-    if gj_todo["features"]:
-        layers.append(pdk.Layer("GeoJsonLayer", gj_todo,
-                                pickable=True,
-                                get_line_color="properties.color",
-                                get_line_width="properties.width",
-                                line_width_min_pixels=4))
-    if gj_done["features"]:
-        layers.append(pdk.Layer("GeoJsonLayer", gj_done,
-                                pickable=True,
-                                get_line_color="properties.color",
-                                get_line_width="properties.width",
-                                line_width_min_pixels=4))
+    if not seg_df.empty:
+        gj_all=make_geojson_lines([{"route": r["route"], "path": r["path"], "color": BASE_GRAY, "width": 4}
+                                   for _, r in seg_df.iterrows()])
+        if gj_all["features"]:
+            layers.append(pdk.Layer("GeoJsonLayer", gj_all, pickable=True,
+                                    get_line_color="properties.color",
+                                    get_line_width="properties.width",
+                                    line_width_min_pixels=4))
+        gj_done=make_geojson_lines([{"route": r["route"], "path": r["path"], "color": HIGHLIGHT_COLOR, "width": 6}
+                                    for _, r in seg_df[seg_df["done"]].iterrows()])
+        if gj_done["features"]:
+            layers.append(pdk.Layer("GeoJsonLayer", gj_done, pickable=True,
+                                    get_line_color="properties.color",
+                                    get_line_width="properties.width",
+                                    line_width_min_pixels=6))
 
     geo=dfc.dropna(subset=["lat","lng"]).copy()
     if not geo.empty:
-        geo["__color"]=geo["완료"].map(lambda b:HIGHLIGHT_COLOR if b else BASE_GRAY)
-        layers.append(pdk.Layer(
-            "ScatterplotLayer",
-            geo.rename(columns={"lat":"latitude","lng":"longitude"}),
-            get_position='[longitude, latitude]',
-            get_fill_color="__color",
-            get_radius=160,
-            pickable=True,
-        ))
+        geo["__color"]=[BASE_GRAY]*len(geo)
+        layers.append(pdk.Layer("ScatterplotLayer",
+                                geo.rename(columns={"lat":"latitude","lng":"longitude"}),
+                                get_position='[longitude, latitude]',
+                                get_fill_color="__color",
+                                get_radius=140, pickable=True))
+        geo_done=geo[geo["완료"]].copy()
+        if not geo_done.empty:
+            geo_done["__color"]=[HIGHLIGHT_COLOR]*len(geo_done)
+            layers.append(pdk.Layer("ScatterplotLayer",
+                                    geo_done.rename(columns={"lat":"latitude","lng":"longitude"}),
+                                    get_position='[longitude, latitude]',
+                                    get_fill_color="__color",
+                                    get_radius=220, pickable=True))
 
     vlat, vlng, vzoom = view_from([], geo, 7.0)
-    st.pydeck_chart(pdk.Deck(
-        layers=layers,
-        initial_view_state=pdk.ViewState(latitude=vlat, longitude=vlng, zoom=vzoom),
-        tooltip={"text":"{properties.route}\n{properties.start_center} → {properties.end_center}"},
-    ), use_container_width=True)
+    st.pydeck_chart(pdk.Deck(layers=layers,
+                             initial_view_state=pdk.ViewState(latitude=vlat, longitude=vlng, zoom=vzoom),
+                             tooltip={"text":"{properties.route}"}),
+                    use_container_width=True)
