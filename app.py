@@ -1,6 +1,4 @@
-# app.py — 전체=회색 / 선택=하이라이트(즉시 반영 멀티선택)
-#         표 체크(두 번 클릭) 제거 → st.multiselect로 1클릭 반영
-#         경로는 노선별로 분리, 중복 레이어 최소화
+# app.py — 선택 없음=회색 베이스만, 선택=하늘색 하이라이트(즉시 반영)
 from __future__ import annotations
 import json, math, time
 from pathlib import Path
@@ -10,11 +8,11 @@ import streamlit as st
 import pydeck as pdk
 import requests
 
-BUILD_TAG = "2025-08-31-geojson-v12"
+BUILD_TAG = "2025-08-31-geojson-v13"
 st.set_page_config(page_title="국토종주 누적거리 트래커", layout="wide")
 st.caption(f"BUILD: {BUILD_TAG}")
 
-# ───────── 기본 데이터/정의 ─────────
+# ───────────────── 기본 정의 ─────────────────
 OFFICIAL_TOTALS = {
     "아라자전거길": 21, "한강종주자전거길(서울구간)": 40, "남한강자전거길": 132,
     "새재자전거길": 100, "낙동강자전거길": 389, "금강자전거길": 146,
@@ -35,6 +33,7 @@ def norm_name(s:str)->str:
 ROUTE_TO_BIG={norm_name(r):b for b,rs in BIG_TO_ROUTES.items() for r in rs}
 ALL_DEFINED_ROUTES=sorted({norm_name(r) for v in BIG_TO_ROUTES.values() for r in v})
 
+# 폴백 경로([lng,lat])
 _raw_fb={
     "아라자전거길": [[126.58,37.60],[126.68,37.60],[126.82,37.57]],
     "한강종주자전거길(서울구간)": [[126.82,37.57],[127.02,37.55],[127.08,37.54]],
@@ -78,7 +77,7 @@ def densify_path(path, segment_km:float=5.0):
             t=i/(n+1)
             out.append([x1+(x2-x1)*t, y1+(y2-y1)*t])
         out.append([x2,y2])
-    # 중복 제거
+    # 인접 중복 제거
     dedup=[out[0]]
     for x,y in out[1:]:
         if x!=dedup[-1][0] or y!=dedup[-1][1]:
@@ -94,8 +93,8 @@ def make_geojson(items):
         feats.append({
             "type":"Feature",
             "properties":{"route":it.get("route",""),
-                          "color":(it.get("color") or [28,200,138])+[255],
-                          "width":int(it.get("width") or 4)},
+                          "color":(it.get("color") or [28,200,255])+[255],
+                          "width":int(it.get("width") or 6)},
             "geometry":{"type":"LineString","coordinates":coords},
         })
     return {"type":"FeatureCollection","features":feats}
@@ -119,7 +118,7 @@ def view_from(paths, centers_df, base_zoom:float):
     zoom=6.0 if span>3.0 else base_zoom
     return vlat,vlng,zoom
 
-# ───────── 로딩 ─────────
+# ───────────────── 로딩 ─────────────────
 @st.cache_data
 def load_routes(src):
     df=pd.read_csv(src)
@@ -145,8 +144,8 @@ def load_centers(src, auto_geo:bool):
     for c in ["center","address","id"]: df[c]=df[c].astype(str).str.strip()
     for c in ["lat","lng","seq","leg_km"]: df[c]=pd.to_numeric(df[c],errors="coerce")
     if auto_geo:
-        to_fix=df[df["address"].notna() & (df["lat"].isna() | df["lng"].isna())]
-        for i,row in to_fix.iterrows():
+        need=df[df["address"].notna() & (df["lat"].isna() | df["lng"].isna())]
+        for i,row in need.iterrows():
             try:
                 j=requests.get("https://nominatim.openstreetmap.org/search",
                                params={"q":row["address"],"format":"json","limit":1},
@@ -157,7 +156,7 @@ def load_centers(src, auto_geo:bool):
             except: pass
     return df
 
-# ───────── 옵션 ─────────
+# ───────────────── 옵션 ─────────────────
 st.sidebar.header("데이터")
 use_repo=st.sidebar.radio("불러오기 방식",["Repo 내 파일","CSV 업로드"],index=0)
 auto_geo=st.sidebar.toggle("주소 → 좌표 자동보정(지오코딩)", value=True)
@@ -176,9 +175,8 @@ else:
     routes=load_routes(r_up)
     centers=load_centers(c_up, auto_geo) if c_up else None
 
-GREY=[170,170,170]
-HL=[0,200,255]   # 하이라이트 고정색(파란 시안)
-HL_W=7; GREY_W=4
+GREY=[170,170,170]; GREY_W=3
+HL=[0,200,255]; HL_W=7
 
 tab=st.radio("",["🚴 구간(거리) 추적","📍 인증센터"], horizontal=True, label_visibility="collapsed")
 
@@ -198,7 +196,7 @@ if tab=="🚴 구간(거리) 추적":
     all_route_names=sorted(routes["route"].unique().tolist())
     big, picked = pick_by_big(all_route_names + ALL_DEFINED_ROUTES, "seg", use_defined=True)
 
-    # 노선별 경로 확보(사용자 path > 센터 path > 폴백), 보간
+    # 노선별 path 구성: routes.path > centers > fallback
     def centers_path(rname:str):
         if centers is None: return None, np.nan
         g=centers[(centers["route"]==rname)].dropna(subset=["lat","lng"]).sort_values("seq")
@@ -210,45 +208,44 @@ if tab=="🚴 구간(거리) 추적":
 
     items=[]; view_paths=[]
     for r in picked:
-        path=None; src=None; disp_km=float(OFFICIAL_TOTALS.get(r,0))
+        path=None; km=float(OFFICIAL_TOTALS.get(r,0))
         sub=routes[routes["route"]==r]
         if not sub.empty and "path" in sub.columns and sub["path"].notna().any():
             p=sub["path"].dropna().iloc[0]
-            if p and len(p)>=2: path=p; src="routes.path"
+            if p and len(p)>=2: path=p
         if path is None:
             p2,k2=centers_path(r)
-            if p2 and len(p2)>=2: path=p2; src="centers"; 
-            if p2 and not np.isnan(k2): disp_km=float(k2)
+            if p2 and len(p2)>=2: path=p2; 
+            if p2 and not np.isnan(k2): km=float(k2)
         if path is None:
             fb=FALLBACK_PATHS.get(r)
-            if fb and len(fb)>=2: path=fb; src="fallback"
+            if fb and len(fb)>=2: path=fb
         if path is not None:
             path=densify_path(path, 5.0)
-            items.append({"route":norm_name(r), "path":path, "km":disp_km})
+            items.append({"route":norm_name(r), "path":path, "km":km})
             view_paths.append(path)
 
-    # ▶ 선택은 표 체크 대신 멀티선택(즉시 반영)
-    st.subheader("지도 하이라이트(즉시 반영)")
+    # ✅ 하이라이트 멀티선택 (기본: 선택 없음)
+    st.subheader("하이라이트 선택(완료 간주)")
     highlight = st.multiselect(
-        "하이라이트할 노선을 선택하세요",
+        "지도로 강조할 노선을 고르세요(여러 개 가능)",
         [it["route"] for it in items],
-        default=[items[0]["route"]] if items else [],
+        default=[],  # ← 기본 비어있음
         key="highlight_routes"
     )
     highlight=set(map(norm_name, highlight))
 
-    # 거리 카드
+    # 요약 카드
     total_km=sum(it["km"] for it in items)
     done_km=sum(it["km"] for it in items if it["route"] in highlight)
     left_km=max(total_km-done_km,0.0)
-
     c1,c2,c3,c4=st.columns(4)
     c1.metric("선택 구간 총거리(표 합계)", f"{total_km:,.1f} km")
     c2.metric("완료 누적거리(하이라이트 합)", f"{done_km:,.1f} km")
     c3.metric("남은 거리", f"{left_km:,.1f} km")
     c4.metric("대분류", big)
 
-    # 지도 레이어: 베이스라인(회색) + 하이라이트(고정색)
+    # 지도 레이어
     layers=[]
     if items and show_baseline:
         grey_items=[{"route":it["route"], "path":it["path"], "color":GREY, "width":GREY_W} for it in items]
@@ -256,9 +253,7 @@ if tab=="🚴 구간(거리) 추적":
         layers.append(pdk.Layer("GeoJsonLayer", gj_grey,
                                 get_line_color="properties.color",
                                 get_line_width="properties.width",
-                                line_width_min_pixels=3,
-                                pickable=False))
-
+                                line_width_min_pixels=3, pickable=False))
     hi_items=[{"route":it["route"], "path":it["path"], "color":HL, "width":HL_W}
               for it in items if it["route"] in highlight]
     if hi_items:
@@ -266,9 +261,9 @@ if tab=="🚴 구간(거리) 추적":
         layers.append(pdk.Layer("GeoJsonLayer", gj_hi,
                                 get_line_color="properties.color",
                                 get_line_width="properties.width",
-                                line_width_min_pixels=6,
-                                pickable=True))
+                                line_width_min_pixels=6, pickable=True))
 
+    # 센터 점(연한 회색, 참고용)
     centers_for_view=None
     if centers is not None:
         g=centers[centers["route"].isin(picked)].dropna(subset=["lat","lng"]).copy()
@@ -287,6 +282,6 @@ if tab=="🚴 구간(거리) 추적":
         tooltip={"text":"{properties.route}"},
     ), use_container_width=True)
 
-# ───────── 2) 인증센터(기존 유지) ─────────
+# ───────── 2) 인증센터(필요 시 동일 패턴으로 확장) ─────────
 else:
-    st.info("인증센터 지도는 기존 로직 유지(선택·완료 기준 색 표시). 필요하면 여기에도 동일한 멀티선택 하이라이트를 붙일 수 있어요.")
+    st.info("인증센터 탭은 필요 시 동일한 하이라이트 멀티선택 패턴을 적용할 수 있어요.")
