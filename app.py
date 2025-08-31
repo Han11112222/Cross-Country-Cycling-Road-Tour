@@ -1,5 +1,5 @@
 # app.py — 폴백+센터 경로 강제 렌더 / GeoJson + Path + Scatter 동시 표시
-#        체크박스 즉시 편집 / 선택(완료) 노선 색상 하이라이트
+#        체크박스 즉시 반영(edited 기반) / 회색 베이스라인 온오프 / 경로 보간(densify)
 from __future__ import annotations
 import json, math, time
 from pathlib import Path
@@ -9,7 +9,7 @@ import streamlit as st
 import pydeck as pdk
 import requests
 
-BUILD_TAG = "2025-08-31-geojson-v9"
+BUILD_TAG = "2025-08-31-geojson-v10"
 st.set_page_config(page_title="국토종주 누적거리 트래커", layout="wide")
 st.caption(f"BUILD: {BUILD_TAG}")
 
@@ -89,8 +89,7 @@ def view_from_safe(paths, centers_df, base_zoom: float):
                     pts.append([lat,lng])
             except: pass
     if centers_df is not None and hasattr(centers_df,"empty") and not centers_df.empty:
-        try:
-            pts += centers_df[["lat","lng"]].dropna().astype(float).values.tolist()
+        try: pts += centers_df[["lat","lng"]].dropna().astype(float).values.tolist()
         except: pass
     if not pts: return 36.2,127.5,base_zoom
     arr=np.asarray(pts,float)
@@ -98,6 +97,25 @@ def view_from_safe(paths, centers_df, base_zoom: float):
     span=max(np.ptp(arr[:,0]),np.ptp(arr[:,1])) if arr.shape[0]>1 else 0.0
     zoom=6.0 if span>3.0 else base_zoom
     return vlat,vlng,zoom
+
+# 거리 기반 보간: 각 선분을 최대 segment_km 간격으로 분할해 Path를 촘촘히
+def densify_path(path, segment_km: float = 5.0):
+    if not path or len(path) < 2: return path
+    out=[path[0]]
+    for (x1,y1),(x2,y2) in zip(path[:-1], path[1:]):
+        d=haversine_km(y1,x1,y2,x2)
+        if d is None or np.isnan(d): continue
+        n=max(1,int(d//segment_km))
+        for i in range(1,n+1):
+            t=i/(n+1)
+            out.append([x1+(x2-x1)*t, y1+(y2-y1)*t])
+        out.append([x2,y2])
+    # 중복 제거
+    dedup=[out[0]]
+    for x,y in out[1:]:
+        if x!=dedup[-1][0] or y!=dedup[-1][1]:
+            dedup.append([x,y])
+    return dedup
 
 def make_geojson_lines(items):
     feats=[]
@@ -176,7 +194,7 @@ def load_centers(src, auto_geo: bool):
 st.sidebar.header("데이터")
 use_repo=st.sidebar.radio("불러오기 방식",["Repo 내 파일","CSV 업로드"],index=0)
 auto_geo=st.sidebar.toggle("주소 → 좌표 자동보정(지오코딩)", value=True)
-show_debug=st.sidebar.checkbox("디버그 보기", value=False)
+show_baseline=st.sidebar.toggle("회색 베이스라인(전체 노선) 표시", value=True)
 if st.sidebar.button("↻ 캐시 초기화", use_container_width=True):
     st.cache_data.clear(); st.rerun()
 
@@ -238,68 +256,63 @@ if tab=="🚴 구간(거리) 추적":
             else sum(haversine_km(pts[i][1],pts[i][0],pts[i+1][1],pts[i+1][0]) for i in range(len(pts)-1))
         return pts, km
 
-    summary, fallback_rows, main_rows, view_paths = [], [], [], []
+    summary, items_raw, view_paths = [], [], []
 
     for r in picked:
         color = ROUTE_COLORS.get(r, [28,200,138])
-
         fb = FALLBACK_PATHS.get(r)
-        if fb and len(fb) >= 2:
-            view_paths.append(fb)
+        if fb and len(fb) >= 2: view_paths.append(fb)
         sub=routes2[routes2["route"]==r]
         src="fallback" if fb else "없음"
         used_points=len(fb) if fb else 0
         disp_km=float(OFFICIAL_TOTALS.get(r, 0.0))
 
-        chosen_path=None
+        chosen=None
         if not sub.empty and sub["path"].notna().any():
             p=sub["path"].dropna().iloc[0]
-            if p and len(p)>=2:
-                chosen_path=p; src="routes.path"; used_points=len(p); view_paths.append(p)
+            if p and len(p)>=2: chosen=p; src="routes.path"; used_points=len(p); view_paths.append(p)
         else:
             p2,k2 = centers_path(r)
             if p2 and len(p2)>=2:
-                chosen_path=p2; src="centers"; used_points=len(p2); view_paths.append(p2)
+                chosen=p2; src="centers"; used_points=len(p2); view_paths.append(p2)
                 disp_km=float(k2) if not np.isnan(k2) else disp_km
-        if chosen_path is None and fb: chosen_path=fb
+        if chosen is None and fb: chosen=fb
 
-        if chosen_path is not None:
-            main_rows.append({"route": r, "path": chosen_path, "color": color, "width": 6})
+        if chosen is not None:
+            # 보간으로 촘촘하게
+            items_raw.append({"route": r, "path": densify_path(chosen, segment_km=5.0), "color": color, "width": 6})
         summary.append({"route": r, "경로소스": src, "포인트수": used_points, "표시거리(km)": disp_km})
 
     with st.expander("선택 노선 총거리 요약", expanded=True):
         st.dataframe(pd.DataFrame(summary), use_container_width=True, hide_index=True)
 
-    # 편집 테이블 (체크 1클릭 토글, 나머지 잠금)
+    # 편집 테이블(한 번 클릭으로 즉시 반영)
     base=routes[routes["route"].isin(picked)][["route","section","distance_km","id"]].copy()
     base["완료"]=base["id"].isin(st.session_state.done_section_ids)
     edited=st.data_editor(
         base.drop(columns=["id"]),
         column_config={
-            "완료": st.column_config.CheckboxColumn(
-                "완료/선택(하이라이트)", help="체크하면 지도에서 해당 노선이 색상 하이라이트 됩니다."
-            ),
+            "완료": st.column_config.CheckboxColumn("완료/선택(하이라이트)", help="체크하면 지도에 색상 하이라이트"),
             "route": st.column_config.TextColumn("route", disabled=True),
             "section": st.column_config.TextColumn("section", disabled=True),
             "distance_km": st.column_config.NumberColumn("distance_km", disabled=True),
         },
-        num_rows="fixed",
-        use_container_width=True,
-        hide_index=True,
-        key="editor_routes",
+        num_rows="fixed", use_container_width=True, hide_index=True, key="editor_routes",
     )
 
-    # 체크 결과를 세션 상태에 반영
+    # ← 하이라이트는 'edited'의 체크를 직접 사용(클릭 즉시 지도 반영)
+    selected_routes = set(edited.loc[edited["완료"], "route"].astype(str).tolist())
+
+    # 세션 상태도 갱신(거리 지표용)
     id_by_key=dict(zip(base["route"].astype(str)+"@"+base["section"].astype(str), base["id"]))
     new_done=set()
     for _,row in edited.iterrows():
-        key=f"{row['route']}@{row['section']}"
-        rid=id_by_key.get(key)
+        k=f"{row['route']}@{row['section']}"
+        rid=id_by_key.get(k)
         if rid and bool(row["완료"]): new_done.add(rid)
     st.session_state.done_section_ids=new_done
     base["완료"]=base["id"].isin(st.session_state.done_section_ids)
 
-    # 완료/남은 거리
     total_km=float(base["distance_km"].fillna(0).sum()) if not base.empty else float(pd.DataFrame(summary)["표시거리(km)"].sum())
     done_km=float(base.loc[base["완료"],"distance_km"].fillna(0).sum())
     if done_km==0 and not base.empty:
@@ -312,32 +325,28 @@ if tab=="🚴 구간(거리) 추적":
     c3.metric("남은 거리", f"{left_km:,.1f} km")
     c4.metric("대분류", big)
 
-    # ── 지도 레이어: 기본(회색) + 하이라이트(선택 노선) ──
-    # 모든 노선을 회색으로
-    grey_items=[{**it, "color": GREY, "width": 5} for it in main_rows]
-    gj_grey = make_geojson_lines(grey_items)
-
-    # 체크된(완료) 노선만 원색 하이라이트
-    selected_routes = base.loc[base["완료"], "route"].astype(str).unique().tolist()
-    hi_items=[]
-    for it in main_rows:
-        if it["route"] in selected_routes:
-            hi = {**it, "color": ROUTE_COLORS.get(it["route"], [255,80,80]), "width": 7}
-            hi_items.append(hi)
-    gj_hi = make_geojson_lines(hi_items)
-
+    # ── 지도 레이어 구성: 베이스라인(회색, 옵션) + 하이라이트 ──
     layers=[]
-    if gj_grey["features"]:
-        layers.append(pdk.Layer("GeoJsonLayer", gj_grey, pickable=True,
-                                get_line_color="properties.color",
-                                get_line_width="properties.width",
-                                line_width_min_pixels=4))
-    if gj_hi["features"]:
-        layers.append(pdk.Layer("GeoJsonLayer", gj_hi, pickable=True,
-                                get_line_color="properties.color",
-                                get_line_width="properties.width",
-                                line_width_min_pixels=6))
-        # Path + 점도 같이(더 선명)
+    if show_baseline and items_raw:
+        grey_items=[{**it, "color": GREY, "width": 5} for it in items_raw]
+        gj_grey = make_geojson_lines(grey_items)
+        if gj_grey["features"]:
+            layers.append(pdk.Layer("GeoJsonLayer", gj_grey, pickable=True,
+                                    get_line_color="properties.color",
+                                    get_line_width="properties.width",
+                                    line_width_min_pixels=4))
+
+    # 선택(완료)된 노선만 하이라이트
+    hi_items=[{**it, "color": ROUTE_COLORS.get(it["route"], [255,80,80]), "width": 7}
+              for it in items_raw if it["route"] in selected_routes]
+    if hi_items:
+        gj_hi = make_geojson_lines(hi_items)
+        if gj_hi["features"]:
+            layers.append(pdk.Layer("GeoJsonLayer", gj_hi, pickable=True,
+                                    get_line_color="properties.color",
+                                    get_line_width="properties.width",
+                                    line_width_min_pixels=6))
+        # Path + 점(보장/가독성)
         path_df = items_to_path_df(hi_items)
         if not path_df.empty:
             layers.append(pdk.Layer("PathLayer", path_df,
@@ -417,12 +426,10 @@ else:
     c3.metric("센터 기준 누적거리", f"{done:,.1f} km")
     c4.metric("센터 기준 남은 거리", f"{left:,.1f} km")
 
-    done_items=[{"route": r["route"], "path": r["path"], "color": [28,200,138], "width": 4}
+    done_items=[{"route": r["route"], "path": densify_path(r["path"], 5.0), "color": [28,200,138], "width": 4}
                 for _, r in seg_df[seg_df["done"]].iterrows()]
-    todo_items=[{"route": r["route"], "path": r["path"], "color": [230,57,70], "width": 4}
+    todo_items=[{"route": r["route"], "path": densify_path(r["path"], 5.0), "color": [230,57,70], "width": 4}
                 for _, r in seg_df[~seg_df["done"]].iterrows()]
-
-    # 선은 그대로, 점은 작게
     gj_done=make_geojson_lines(done_items)
     gj_todo=make_geojson_lines(todo_items)
 
@@ -437,8 +444,6 @@ else:
                                 get_line_color="properties.color",
                                 get_line_width="properties.width",
                                 line_width_min_pixels=4))
-
-    # Path/Points(보장)
     path_df2 = items_to_path_df(done_items + todo_items)
     if not path_df2.empty:
         layers.append(pdk.Layer("PathLayer", path_df2, get_path="path", get_color="color",
