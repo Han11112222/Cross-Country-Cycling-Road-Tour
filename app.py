@@ -1,4 +1,4 @@
-# app.py — 거리(구간) + 인증센터, 단일클릭 체크, 그랜드슬램 전구간 기본표시, 안전한 뷰/경로 렌더
+# app.py — 거리(구간)=회색 베이스 + 완료(체크)=흰색 오버레이, 1클릭 반영, 인증센터 탭 유지
 from __future__ import annotations
 import json, math, time
 from pathlib import Path
@@ -9,7 +9,7 @@ import pydeck as pdk
 import requests
 import streamlit as st
 
-BUILD_TAG = "2025-09-02-vfix-gs-click1"
+BUILD_TAG = "2025-09-02-vfix-gs-click1b"
 
 st.set_page_config(page_title="국토종주 누적거리 트래커", layout="wide")
 st.caption(f"BUILD: {BUILD_TAG}")
@@ -25,7 +25,7 @@ OFFICIAL_TOTALS = {
     "제주환상": 234, "제주환상자전거길": 234,
 }
 
-# 분류/명칭 표준화
+# 분류/명칭
 TOP_ORDER = ["국토종주", "4대강 종주", "그랜드슬램", "제주환상"]
 BIG_TO_ROUTES = {
     "국토종주": ["아라자전거길","한강종주자전거길(서울구간)","남한강자전거길","새재자전거길","낙동강자전거길"],
@@ -36,7 +36,6 @@ BIG_TO_ROUTES = {
 def norm_name(s: str) -> str:
     s = str(s).strip()
     return "제주환상" if s == "제주환상자전거길" else s
-
 ROUTE_TO_BIG = {norm_name(r): big for big, rs in BIG_TO_ROUTES.items() for r in rs}
 ALL_DEFINED_ROUTES = sorted({norm_name(r) for v in BIG_TO_ROUTES.values() for r in v})
 
@@ -58,9 +57,7 @@ _raw_fb = {
 }
 FALLBACK_PATHS = {norm_name(k): v for k, v in _raw_fb.items()}
 
-# ─────────────────────────────────────────────────────────────
 # 유틸
-# ─────────────────────────────────────────────────────────────
 def haversine_km(a,b,c,d):
     if any(pd.isna([a,b,c,d])): return np.nan
     R=6371.0088
@@ -73,8 +70,7 @@ def parse_path(s):
     try:
         v=json.loads(s)
         if isinstance(v,list): return v
-    except Exception:
-        pass
+    except Exception: pass
     return None
 
 @st.cache_data(ttl=60*60*24)
@@ -85,12 +81,11 @@ def geocode(addr:str):
                        headers={"User-Agent":"ccct/1.0"}, timeout=10)
         if r.ok and r.json():
             j=r.json()[0]; return float(j["lat"]), float(j["lon"])
-    except Exception:
-        pass
+    except Exception: pass
     return None,None
 
 def view_from_safe(paths, centers_df, base_zoom: float):
-    pts = []
+    pts=[]
     for p in (paths or []):
         for xy in (p or []):
             try:
@@ -106,12 +101,11 @@ def view_from_safe(paths, centers_df, base_zoom: float):
             pass
     if not pts:
         return 36.2, 127.5, base_zoom
-    arr = np.asarray(pts, dtype=float).reshape(-1, 2)
-    vlat = float(np.nanmean(arr[:, 0])); vlng = float(np.nanmean(arr[:, 1]))
-    span_lat = float(np.nanmax(arr[:, 0]) - np.nanmin(arr[:, 0])) if arr.shape[0] > 1 else 0.0
-    span_lng = float(np.nanmax(arr[:, 1]) - np.nanmin(arr[:, 1])) if arr.shape[0] > 1 else 0.0
-    span = max(span_lat, span_lng)
-    zoom = 6.0 if span > 3.0 else base_zoom
+    arr=np.asarray(pts,float).reshape(-1,2)
+    vlat=float(np.nanmean(arr[:,0])); vlng=float(np.nanmean(arr[:,1]))
+    span=max(float(np.nanmax(arr[:,0])-np.nanmin(arr[:,0])) if arr.shape[0]>1 else 0.0,
+             float(np.nanmax(arr[:,1])-np.nanmin(arr[:,1])) if arr.shape[0]>1 else 0.0)
+    zoom=6.0 if span>3.0 else base_zoom
     return vlat, vlng, zoom
 
 def make_geojson_lines(items):
@@ -121,7 +115,7 @@ def make_geojson_lines(items):
         if not isinstance(coords,list) or len(coords)<2: 
             continue
         try:
-            if any((pd.isna(x) or pd.isna(y)) for x,y in coords):
+            if any((pd.isna(x) or pd.isna(y)) for x,y in coords): 
                 continue
         except Exception:
             continue
@@ -134,9 +128,7 @@ def make_geojson_lines(items):
         })
     return {"type":"FeatureCollection","features":feats}
 
-# ─────────────────────────────────────────────────────────────
 # 데이터 로딩
-# ─────────────────────────────────────────────────────────────
 @st.cache_data
 def load_routes(src):
     df=pd.read_csv(src)
@@ -178,9 +170,7 @@ def load_centers(src, auto_geo: bool):
     df["big"]=pd.Categorical(df["big"],categories=TOP_ORDER,ordered=True)
     return df
 
-# ─────────────────────────────────────────────────────────────
 # 사이드바
-# ─────────────────────────────────────────────────────────────
 st.sidebar.header("데이터")
 use_repo=st.sidebar.radio("불러오기 방식",["Repo 내 파일","CSV 업로드"],index=0)
 auto_geo=st.sidebar.toggle("주소 → 좌표 자동보정(지오코딩)", value=True)
@@ -202,6 +192,7 @@ else:
 st.session_state.setdefault("done_section_ids", set())
 st.session_state.setdefault("done_center_ids", set())
 
+# 색상 팔레트(거리 탭에서는 '컬러 오버레이=흰색'만 사용)
 ROUTE_COLORS = {
     "아라자전거길": [0,173,181], "한강종주자전거길(서울구간)": [0,122,255], "남한강자전거길": [88,86,214],
     "새재자전거길": [255,159,10], "낙동강자전거길": [255,45,85], "금강자전거길": [255,204,0],
@@ -210,29 +201,21 @@ ROUTE_COLORS = {
     "제주환상": [255,69,0],
 }
 
-# ─────────────────────────────────────────────────────────────
-# 공통: 대분류 → 노선 선택
-# ─────────────────────────────────────────────────────────────
 def pick_by_big(all_routes: list[str], key_prefix: str, use_defined=True):
     big=st.sidebar.selectbox("대분류", TOP_ORDER, index=0, key=f"{key_prefix}_big")
     defined=[norm_name(r) for r in BIG_TO_ROUTES.get(big,[])] if use_defined else all_routes
-    present=[r for r in defined if r in all_routes]
-    absent=[r for r in defined if r not in all_routes]
-    options=defined + [r for r in all_routes if r not in defined]  # 정의된 것 우선
-    # ★ 기본 선택: 정의된 모든 노선(존재/부재 상관없이)
-    default_sel=defined if defined else (present or options[:1])
+    options=defined + [r for r in all_routes if r not in defined]
+    default_sel=defined if defined else options[:1]
     fmt=lambda r: r if r in all_routes else f"{r}  • 데이터없음(폴백)"
     picked=st.sidebar.multiselect("노선(복수 선택 가능)", options, default=default_sel,
                                   format_func=fmt, key=f"{key_prefix}_routes")
     return big, [norm_name(r) for r in picked]
 
-# ─────────────────────────────────────────────────────────────
 # 탭
-# ─────────────────────────────────────────────────────────────
 tab=st.radio("",["🚴 구간(거리) 추적","📍 인증센터"], horizontal=True, label_visibility="collapsed")
 
 # ─────────────────────────────────────────────────────────────
-# 1) 거리 추적
+# 1) 거리(구간) — 회색 베이스 + 완료만 흰색 오버레이
 # ─────────────────────────────────────────────────────────────
 if tab=="🚴 구간(거리) 추적":
     st.sidebar.header("구간 선택")
@@ -253,55 +236,55 @@ if tab=="🚴 구간(거리) 추적":
             else sum(haversine_km(pts[i][1],pts[i][0],pts[i+1][1],pts[i+1][0]) for i in range(len(pts)-1))
         return pts, km
 
-    summary, fallback_rows, main_rows, view_paths = [], [], [], []
-
-    for r in picked:
-        color = ROUTE_COLORS.get(r, [28,200,138])
-
-        fb = FALLBACK_PATHS.get(r)
-        if fb and len(fb) >= 2:
-            fallback_rows.append({"route": r, "path": fb, "color": [190,190,190], "width": 5})
-            view_paths.append(fb)
-
-        sub=routes2[routes2["route"]==r]
-        src="fallback" if fb else "없음"
-        used_points=len(fb) if fb else 0
-        disp_km=float(OFFICIAL_TOTALS.get(r, 0.0))
-
-        if not sub.empty and sub["path"].notna().any():
-            p=sub["path"].dropna().iloc[0]
-            if p and len(p)>=2:
-                main_rows.append({"route": r, "path": p, "color": color, "width": 6})
-                view_paths.append(p)
-                src="routes.path"; used_points=len(p)
-        else:
-            p2,k2 = centers_path(r)
-            if p2 and len(p2)>=2:
-                main_rows.append({"route": r, "path": p2, "color": color, "width": 6})
-                view_paths.append(p2)
-                src="centers"; used_points=len(p2); disp_km=float(k2) if not np.isnan(k2) else disp_km
-
-        sub_km=float(sub["distance_km"].fillna(0).sum()) if not sub.empty else 0.0
-        if sub_km>0: disp_km=sub_km
-
-        summary.append({"route": r, "경로소스": src, "포인트수": used_points, "표시거리(km)": disp_km})
-
-    with st.expander("선택 노선 총거리 요약", expanded=True):
-        st.dataframe(pd.DataFrame(summary), use_container_width=True, hide_index=True)
-
-    # ■ 한 번 클릭으로 되는 체크 UI
+    # ✔ 완료 체크(1클릭) — 여기서 선택한 노선만 흰색 오버레이
     base=routes[routes["route"].isin(picked)][["route","section","distance_km","id"]].copy()
     base=base.sort_values(["route","section"]).reset_index(drop=True)
     done_set=set(st.session_state.get("done_section_ids", set()))
-
     with st.expander("완료 구간 체크(한 번 클릭으로 즉시 반영)", expanded=True):
         new_done=set()
         for i,row in base.iterrows():
-            rid=str(row["id"]); label=f"{row['route']} — {row['section']}  ({row['distance_km']:.1f} km)"
+            rid=str(row["id"]); label=f"{row['route']} — {row['section']} ({row['distance_km']:.1f} km)"
             checked=st.checkbox(label, value=(rid in done_set), key=f"sec_{rid}")
             if checked: new_done.add(rid)
         st.session_state.done_section_ids=new_done
         done_set=new_done
+    # 완료된 '노선 이름' 집합
+    routes_done = set(base.loc[base["id"].isin(done_set), "route"])
+
+    # 지도 레이어 준비
+    view_paths=[]
+    grey_rows=[]   # 베이스(회색) — 모든 picked 노선
+    white_rows=[]  # 오버레이(흰색) — 완료 체크된 노선만
+
+    summary=[]
+    for r in picked:
+        # 경로 소스 우선순위: routes.path > centers > fallback
+        best=None; src=""; used=0
+        sub=routes2[routes2["route"]==r]
+        if not sub.empty and sub["path"].notna().any():
+            best=sub["path"].dropna().iloc[0]; src="routes.path"; used=len(best)
+        else:
+            p2,_k2=centers_path(r)
+            if p2 and len(p2)>=2: best=p2; src="centers"; used=len(p2)
+        if best is None:
+            fb = FALLBACK_PATHS.get(r)
+            if fb and len(fb)>=2: best=fb; src="fallback"; used=len(fb)
+
+        if best and len(best)>=2:
+            view_paths.append(best)
+            # 1) 회색 베이스는 항상
+            grey_rows.append({"route": r, "path": best, "color": [185,185,185], "width": 4})
+            # 2) 완료 체크된 노선만 흰색 오버레이
+            if r in routes_done:
+                white_rows.append({"route": r, "path": best, "color": [255,255,255], "width": 6})
+
+        disp_km=float(OFFICIAL_TOTALS.get(r,0.0))
+        sub_km=float(sub["distance_km"].fillna(0).sum()) if not sub.empty else 0.0
+        if sub_km>0: disp_km=sub_km
+        summary.append({"route": r, "경로소스": src, "포인트수": used, "표시거리(km)": disp_km})
+
+    with st.expander("선택 노선 총거리 요약", expanded=True):
+        st.dataframe(pd.DataFrame(summary), use_container_width=True, hide_index=True)
 
     # 거리 집계
     total_km=float(base["distance_km"].fillna(0).sum()) if not base.empty else float(pd.DataFrame(summary)["표시거리(km)"].sum())
@@ -316,29 +299,22 @@ if tab=="🚴 구간(거리) 추적":
     c3.metric("남은 거리", f"{left_km:,.1f} km")
     c4.metric("대분류", big)
 
-    # 선 레이어는 GeoJsonLayer만(빨간선 방지)
-    gj_fallback = make_geojson_lines(fallback_rows)
-    gj_main = make_geojson_lines(main_rows)
-
+    # 레이어(빨간선 없음!) — 회색 베이스 + 흰색 오버레이
+    gj_grey = make_geojson_lines(grey_rows)
+    gj_white = make_geojson_lines(white_rows)
     layers=[]
-    if gj_fallback["features"]:
-        layers.append(pdk.Layer("GeoJsonLayer", gj_fallback,
+    if gj_grey["features"]:
+        layers.append(pdk.Layer("GeoJsonLayer", gj_grey,
                                 get_line_color="properties.color",
                                 get_line_width="properties.width",
                                 line_width_min_pixels=4, pickable=True))
-    if gj_main["features"]:
-        layers.append(pdk.Layer("GeoJsonLayer", gj_main,
+    if gj_white["features"]:
+        layers.append(pdk.Layer("GeoJsonLayer", gj_white,
                                 get_line_color="properties.color",
                                 get_line_width="properties.width",
                                 line_width_min_pixels=6, pickable=True))
 
-    centers_for_view=None
-    if centers is not None:
-        g=centers[centers["route"].isin(picked)].dropna(subset=["lat","lng"]).copy()
-        if not g.empty:
-            centers_for_view=g.copy()
-
-    vlat, vlng, vzoom = view_from_safe(view_paths, centers_for_view, base_zoom=7.0 if len(picked)==1 else 5.8)
+    vlat, vlng, vzoom = view_from_safe(view_paths, None, base_zoom=7.0 if len(picked)==1 else 5.8)
     st.pydeck_chart(pdk.Deck(
         layers=layers,
         initial_view_state=pdk.ViewState(latitude=vlat, longitude=vlng, zoom=vzoom),
@@ -346,7 +322,7 @@ if tab=="🚴 구간(거리) 추적":
     ), use_container_width=True)
 
 # ─────────────────────────────────────────────────────────────
-# 2) 인증센터
+# 2) 인증센터 — 기존 로직 유지(미완=빨강, 완료=초록)
 # ─────────────────────────────────────────────────────────────
 else:
     if centers is None:
@@ -359,7 +335,6 @@ else:
     dfc=dfc.sort_values(["route","seq","center"]).reset_index(drop=True)
     dfc["완료"]=dfc["id"].isin(st.session_state.done_center_ids)
 
-    # 한 번 클릭 체크 UI
     with st.expander("인증센터 체크(한 번 클릭)", expanded=True):
         new_done=set()
         for i,row in dfc.iterrows():
@@ -369,7 +344,6 @@ else:
         st.session_state.done_center_ids=new_done
         dfc["완료"]=dfc["id"].isin(new_done)
 
-    # 센터 구간 나누기
     seg=[]
     for r,g in dfc.groupby("route"):
         g=g.sort_values("seq"); rec=g.to_dict("records")
@@ -401,7 +375,6 @@ else:
                 for _, r in seg_df[seg_df["done"]].iterrows()]
     todo_items=[{"route": r["route"], "path": r["path"], "color": [230,57,70], "width": 4}
                 for _, r in seg_df[~seg_df["done"]].iterrows()]
-
     gj_done=make_geojson_lines(done_items)
     gj_todo=make_geojson_lines(todo_items)
 
