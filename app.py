@@ -1,5 +1,6 @@
 # app.py — 모든 노선 강제 렌더(폴백+센터+사용자 경로 오버레이)
 #           + GeoJsonLayer 안정화 + 디버그 표 + 색상/가시성 튜닝
+#           + [NEW] PathLayer + ScatterplotLayer 동시 표시(점과 선을 확실히 렌더)
 from __future__ import annotations
 import json, math, time
 from pathlib import Path
@@ -9,7 +10,7 @@ import streamlit as st
 import pydeck as pdk
 import requests
 
-BUILD_TAG = "2025-08-24-geojson-v5"  # ← 화면 상단에 보이면 최신 코드
+BUILD_TAG = "2025-08-31-geojson-v6"  # ← 화면 상단에 보이면 최신 코드
 
 st.set_page_config(page_title="국토종주 누적거리 트래커", layout="wide")
 st.caption(f"BUILD: {BUILD_TAG}")
@@ -124,7 +125,6 @@ def make_geojson_lines(line_items):
     for it in line_items:
         coords=it.get("path") or []
         if not isinstance(coords,list) or len(coords)<2: continue
-        # NaN 좌표가 끼어있으면 무시
         if any((pd.isna(x) or pd.isna(y)) for x,y in coords): continue
         feats.append({
             "type":"Feature",
@@ -136,6 +136,26 @@ def make_geojson_lines(line_items):
             "geometry":{"type":"LineString","coordinates": coords},
         })
     return {"type":"FeatureCollection","features":feats}
+
+# [NEW] PathLayer/Scatterplot용 데이터로 변환
+def items_to_path_df(items):
+    if not items: return pd.DataFrame(columns=["route","path","color","width"])
+    df=pd.DataFrame(items)
+    # 안전: 필요한 컬럼 보장
+    for c in ["route","path","color","width"]:
+        if c not in df.columns: df[c]=None
+    return df[["route","path","color","width"]]
+
+def items_to_points_df(items):
+    rows=[]
+    for it in (items or []):
+        route=it.get("route","")
+        color=it.get("color",[180,180,180])
+        path=it.get("path") or []
+        for lng,lat in path:
+            if pd.isna(lng) or pd.isna(lat): continue
+            rows.append({"route":route, "longitude":float(lng), "latitude":float(lat), "color":color})
+    return pd.DataFrame(rows)
 
 # ─────────────────────────────────────────────────────────────
 # CSV 로딩
@@ -319,11 +339,10 @@ if tab=="🚴 구간(거리) 추적":
     c3.metric("남은 거리", f"{left_km:,.1f} km")
     c4.metric("대분류", big)
 
-    # GeoJSON 레이어 구성
+    # GeoJSON + [NEW] Path/Scatter 레이어 구성
     gj_fallback = make_geojson_lines(fallback_rows)
     gj_main = make_geojson_lines(main_rows)
 
-    # 진단: 피처 개수 표시
     if show_debug:
         st.write({
             "fallback_features": len(gj_fallback["features"]),
@@ -331,6 +350,7 @@ if tab=="🚴 구간(거리) 추적":
         })
 
     layers=[]
+    # GeoJson: 선
     if gj_fallback["features"]:
         layers.append(pdk.Layer(
             "GeoJsonLayer", gj_fallback, pickable=True,
@@ -344,6 +364,29 @@ if tab=="🚴 구간(거리) 추적":
             get_line_color="properties.color",
             get_line_width="properties.width",
             line_width_min_pixels=6,
+        ))
+
+    # [NEW] PathLayer: GeoJson이 안 보이는 환경에서도 선을 보장
+    path_df = items_to_path_df(fallback_rows + main_rows)
+    if not path_df.empty:
+        layers.append(pdk.Layer(
+            "PathLayer", path_df,
+            pickable=True,
+            get_path="path",
+            get_color="color",
+            get_width="width",
+            width_min_pixels=3,
+        ))
+
+    # [NEW] ScatterplotLayer: 경로 꼭지점 좌표를 점으로도 표시(“좌표가 보이도록”)
+    pts_df = items_to_points_df(main_rows if main_rows else fallback_rows)
+    if not pts_df.empty:
+        layers.append(pdk.Layer(
+            "ScatterplotLayer", pts_df,
+            get_position='[longitude, latitude]',
+            get_fill_color="color",
+            get_radius=60,  # 점 크기
+            pickable=True,
         ))
 
     centers_for_view=None
@@ -365,7 +408,7 @@ if tab=="🚴 구간(거리) 추적":
     st.pydeck_chart(pdk.Deck(
         layers=layers,
         initial_view_state=pdk.ViewState(latitude=vlat, longitude=vlng, zoom=vzoom),
-        tooltip={"text": "{properties.route}"},  # GeoJSON은 properties.* 경로 사용
+        tooltip={"text": "{route} {properties.route}"},
     ), use_container_width=True)
 
 # ─────────────────────────────────────────────────────────────
@@ -398,7 +441,6 @@ else:
         g=g.sort_values("seq"); rec=g.to_dict("records")
         for i in range(len(rec)-1):
             a,b=rec[i],rec[i+1]
-            # NaN 좌표는 제외
             if pd.isna(a.get("lat")) or pd.isna(a.get("lng")) or pd.isna(b.get("lat")) or pd.isna(b.get("lng")):
                 continue
             dist=float(a.get("leg_km")) if not pd.isna(a.get("leg_km")) else (haversine_km(a.get("lat"),a.get("lng"),b.get("lat"),b.get("lng")) or 0.0)
@@ -436,6 +478,7 @@ else:
         })
 
     layers=[]
+    # GeoJson 선
     if gj_todo["features"]:
         layers.append(pdk.Layer("GeoJsonLayer", gj_todo,
                                 pickable=True,
@@ -448,6 +491,29 @@ else:
                                 get_line_color="properties.color",
                                 get_line_width="properties.width",
                                 line_width_min_pixels=4))
+
+    # [NEW] PathLayer 선(보장)
+    path_df2 = items_to_path_df(done_items + todo_items)
+    if not path_df2.empty:
+        layers.append(pdk.Layer(
+            "PathLayer", path_df2,
+            pickable=True,
+            get_path="path",
+            get_color="color",
+            get_width="width",
+            width_min_pixels=3,
+        ))
+
+    # [NEW] ScatterplotLayer 점(각 구간의 양 끝점 표시)
+    pts_df2 = items_to_points_df(done_items + todo_items)
+    if not pts_df2.empty:
+        layers.append(pdk.Layer(
+            "ScatterplotLayer", pts_df2,
+            get_position='[longitude, latitude]',
+            get_fill_color="color",
+            get_radius=80,
+            pickable=True,
+        ))
 
     geo=dfc.dropna(subset=["lat","lng"]).copy()
     if not geo.empty:
@@ -465,5 +531,5 @@ else:
     st.pydeck_chart(pdk.Deck(
         layers=layers,
         initial_view_state=pdk.ViewState(latitude=vlat, longitude=vlng, zoom=vzoom),
-        tooltip={"text":"{properties.route}\n{properties.start_center} → {properties.end_center}"},
+        tooltip={"text":"{route}\n{properties.route}\n{properties.start_center} → {properties.end_center}"},
     ), use_container_width=True)
