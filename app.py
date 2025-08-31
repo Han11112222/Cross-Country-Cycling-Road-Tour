@@ -10,7 +10,7 @@ import streamlit as st
 import pydeck as pdk
 import requests
 
-BUILD_TAG = "2025-08-31-geojson-v6"  # ← 화면 상단에 보이면 최신 코드
+BUILD_TAG = "2025-08-31-geojson-v7"  # ← 화면 상단에 보이면 최신 코드
 
 st.set_page_config(page_title="국토종주 누적거리 트래커", layout="wide")
 st.caption(f"BUILD: {BUILD_TAG}")
@@ -103,21 +103,56 @@ def geocode(addr:str):
     except Exception: pass
     return None,None
 
+# [FIXED] 안전 버전
 def view_from(paths, centers_df, base_zoom: float):
-    pts=[]
-    for p in paths or []:
+    """
+    경로/센터 좌표로 초기 지도 중심과 줌을 계산.
+    - 좌표 형태가 들쭉날쭉해도 안전하게 처리
+    - 포인트가 1개뿐이어도 에러 없이 동작
+    """
+    pts = []
+
+    # 경로들: [[lng,lat], ...] → [lat,lng]로 변환하여 수집
+    for p in (paths or []):
         for xy in (p or []):
-            if isinstance(xy,(list,tuple)) and len(xy)==2 and not any(pd.isna(xy)):
-                pts.append([float(xy[1]), float(xy[0])])  # [lat,lng]
-    if centers_df is not None and not centers_df.empty:
-        pts += centers_df[["lat","lng"]].dropna().astype(float).values.tolist()
-    if pts:
-        arr=np.array(pts,float)
-        vlat, vlng = float(arr[:,0].mean()), float(arr[:,1].mean())
-        span=max(arr[:,0].ptp(), arr[:,1].ptp())
-        zoom = 6.0 if span>3 else base_zoom
-        return vlat, vlng, zoom
-    return 36.2, 127.5, base_zoom
+            try:
+                lng, lat = float(xy[0]), float(xy[1])
+            except Exception:
+                continue
+            if not (np.isnan(lat) or np.isnan(lng)):
+                pts.append([lat, lng])
+
+    # 인증센터 좌표 추가
+    if centers_df is not None and hasattr(centers_df, "empty") and not centers_df.empty:
+        try:
+            cxy = centers_df[["lat", "lng"]].dropna().astype(float).values.tolist()
+            pts.extend(cxy)
+        except Exception:
+            pass
+
+    # 포인트 없으면 기본 뷰
+    if not pts:
+        return 36.2, 127.5, base_zoom
+
+    arr = np.asarray(pts, dtype=float)
+    # (N, 2) 보장
+    if arr.ndim != 2 or arr.shape[1] != 2:
+        arr = np.reshape(arr, (-1, 2))
+
+    vlat = float(np.mean(arr[:, 0]))
+    vlng = float(np.mean(arr[:, 1]))
+
+    if arr.shape[0] > 1:
+        # numpy로 안전하게 범위 계산
+        span_lat = float(np.max(arr[:, 0]) - np.min(arr[:, 0]))
+        span_lng = float(np.max(arr[:, 1]) - np.min(arr[:, 1]))
+        span = max(span_lat, span_lng)
+    else:
+        span = 0.0
+
+    # 범위가 넓으면 줌을 조금 더 빼서 보기 좋게
+    zoom = 6.0 if span > 3.0 else base_zoom
+    return vlat, vlng, zoom
 
 def make_geojson_lines(line_items):
     """line_items: [{'route':str,'path':[[lng,lat],...],'color':[r,g,b], 'width':int}, ...]"""
@@ -141,7 +176,6 @@ def make_geojson_lines(line_items):
 def items_to_path_df(items):
     if not items: return pd.DataFrame(columns=["route","path","color","width"])
     df=pd.DataFrame(items)
-    # 안전: 필요한 컬럼 보장
     for c in ["route","path","color","width"]:
         if c not in df.columns: df[c]=None
     return df[["route","path","color","width"]]
